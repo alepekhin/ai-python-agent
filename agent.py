@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 import json
-import sys
 import urllib.error
 import urllib.request
 
-MODEL = "carstenuhlig/omnicoder-2-9b:latest"
-OLLAMA_URL = "http://localhost:11434/api/chat"
-HISTORY_LIMIT = 32
+MODEL: str = "carstenuhlig/omnicoder-2-9b:latest"
+OLLAMA_URL: str = "http://localhost:11434/api/chat"
+HISTORY_LIMIT: int = 32
 
 
-def chat(messages: list[dict]) -> str:
-    payload = json.dumps({
-        "model": MODEL,
-        "messages": messages,
-        "stream": False,
-    }).encode("utf-8")
+def chat(messages: list[dict[str, str]]) -> str:
+    payload = json.dumps(
+        {
+            "model": MODEL,
+            "messages": messages,
+            "stream": False,
+        }
+    ).encode("utf-8")
 
     req = urllib.request.Request(
         OLLAMA_URL,
@@ -30,7 +31,7 @@ def chat(messages: list[dict]) -> str:
 
 
 def main() -> None:
-    messages: list[dict] = []
+    messages: list[dict[str, str]] = []
 
     print("AI agent — press Enter with an empty prompt to exit.\n")
 

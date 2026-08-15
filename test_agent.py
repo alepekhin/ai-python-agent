@@ -16,7 +16,7 @@ import agent
 
 
 class FakeOllamaHandler(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
+    def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", 0))
         self.rfile.read(length)
         body = json.dumps({"message": {"content": "REPLY"}}).encode("utf-8")
@@ -26,41 +26,46 @@ class FakeOllamaHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args):
+    def log_message(self, *args: object) -> None:
         pass
 
 
 class AgentTTYTest(unittest.TestCase):
+    server: http.server.HTTPServer
+    thread: threading.Thread
+    port: int
+
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         cls.server = http.server.HTTPServer(("127.0.0.1", 0), FakeOllamaHandler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.port = cls.server.server_address[1]
 
     @classmethod
-    def tearDownClass(cls):
+    def tearDownClass(cls) -> None:
         cls.server.shutdown()
         cls.server.server_close()
 
-    def _run_agent(self, lines):
+    def _run_agent(self, lines: list[str]) -> str:
         master, slave = pty.openpty()
-        saved_stdin = os.dup(0)
-        saved_stdout = os.dup(1)
-        saved_stderr = os.dup(2)
+        saved_stdin: int = os.dup(0)
+        saved_stdout: int = os.dup(1)
+        saved_stderr: int = os.dup(2)
         os.dup2(slave, 0)
         os.dup2(slave, 1)
         os.dup2(slave, 2)
         os.close(slave)
 
-        old_url, old_model = agent.OLLAMA_URL, agent.MODEL
+        old_url: str = agent.OLLAMA_URL
+        old_model: str = agent.MODEL
         agent.OLLAMA_URL = f"http://127.0.0.1:{self.port}/api/chat"
         agent.MODEL = "test-model"
         sys.stdout.reconfigure(line_buffering=True)
 
-        output = b""
+        output: bytes = b""
 
-        def wait_for(needle, timeout=15):
+        def wait_for(needle: bytes, timeout: float = 15) -> None:
             nonlocal output
             deadline = time.time() + timeout
             while needle not in output:
@@ -98,14 +103,14 @@ class AgentTTYTest(unittest.TestCase):
             agent.OLLAMA_URL, agent.MODEL = old_url, old_model
         return output.decode("utf-8", "replace")
 
-    def test_normal_conversation_then_empty_exit(self):
+    def test_normal_conversation_then_empty_exit(self) -> None:
         output = self._run_agent(["hello\n", "\n"])
         self.assertIn("You: ", output)
         self.assertIn("Thinking...", output)
         self.assertIn("Assistant: REPLY", output)
         self.assertIn("Bye!", output)
 
-    def test_exit_on_empty_prompt(self):
+    def test_exit_on_empty_prompt(self) -> None:
         output = self._run_agent(["\n"])
         self.assertIn("You: ", output)
         self.assertIn("Bye!", output)

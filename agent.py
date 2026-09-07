@@ -160,7 +160,8 @@ def main() -> None:
         readline.read_history_file(HISTORY_FILE)
     readline.set_history_length(1000)
 
-    print("AI agent — press Enter with an empty prompt to exit.\n")
+    print(f"AI agent — using model: {MODEL}")
+    print("Press Enter with an empty prompt to exit.\n")
 
     try:
         while True:

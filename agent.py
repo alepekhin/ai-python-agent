@@ -1,36 +1,36 @@
 #!/usr/bin/env python3
+"""Interactive CLI AI agent with conversation history and web search via Ollama."""
+
 import html
 import json
-import readline
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 
+# Configuration: model, API endpoint, history limit, search service
 MODEL: str = "carstenuhlig/omnicoder-2-9b:latest"
 OLLAMA_URL: str = "http://localhost:11434/api/chat"
-HISTORY_LIMIT: int = 32
+HISTORY_LIMIT: int = 32  # cap history to stay within model context
 DDG_URL: str = "https://html.duckduckgo.com/html/"
 SEARCH_RE: re.Pattern[str] = re.compile(r"\[SEARCH:\s*(.+?)\]")
-SYSTEM_PROMPT: str = (
-    "You are a helpful assistant with access to the internet. "
-    "When you need current or real-time information that you don't have, "
-    "output exactly [SEARCH: your search query] on its own line. "
-    "Search results will be provided to you in the next message. "
-    "IMPORTANT: Each result has a title and a snippet with useful information. "
-    "Extract ALL facts from the snippets — dates, numbers, names, descriptions, "
-    "capabilities, features, or any concrete details mentioned. "
-    "If snippets describe what services or websites offer, summarize that information. "
-    "For example, if a snippet says 'hourly weather forecast with precipitation, "
-    "wind, and UV index', report that this information is available and summarize "
-    "what the results indicate. Never say 'I cannot find' if results are provided. "
-    "Only search when truly necessary — for general knowledge you already "
-    "know, answer directly without searching."
-)
-MAX_SEARCH_RESULTS: int = 5
+
+SYSTEM_PROMPT: str = """You are a helpful assistant with access to the internet.
+1st check your internal knowledge for general questions.
+2nd when you need real-time info: output exactly [SEARCH: query] on its own line.
+Search results will be provided in the next message as numbered title+snippet pairs.
+Extract ALL facts from all snippets — dates, numbers, names, capabilities, features.
+For service/website descriptions: summarize what they offer.
+Weather example: if snippet says 'hourly forecast with precipitation/wind/UV',
+report that info is available and describe the content.
+Never say 'I cannot find' when results are provided.
+Only search when needed — otherwise use general knowledge."""
+
+MAX_SEARCH_RESULTS: int = 5  # max results to show per search
 OPEN_METEO_GEO: str = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_WX: str = "https://api.open-meteo.com/v1/forecast"
+
 WEATHER_RE: re.Pattern[str] = re.compile(
     r"\b(weather|temperature|forecast|rain|snow|wind|humid|cloud|sunny|storm)\b",
     re.IGNORECASE,
@@ -38,6 +38,14 @@ WEATHER_RE: re.Pattern[str] = re.compile(
 
 
 def _get_weather(location: str) -> str:
+    """Fetch and format current weather for a location using Open-Meteo APIs.
+
+    Uses two steps:
+    1. Geocoding API: find lat/lon/name for the given location string.
+    2. Forecast API: get current weather (temperature, wind, condition).
+
+    Returns a formatted string with weather info, or empty string on any error.
+    """
     try:
         geo_url = (
             OPEN_METEO_GEO
@@ -107,6 +115,18 @@ def _get_weather(location: str) -> str:
 
 
 def search_web(query: str) -> str:
+    """Search the web for the given query using DuckDuckGo, optionally fetching weather.
+
+    Returns a formatted string with up to MAX_SEARCH_RESULTS (5) entries:
+    each entry has a numbered title and a snippet.
+
+    If the query mentions weather (via WEATHER_RE), extracts the location string
+    from the query (stripping common prepositions and country names), then calls
+    _get_weather() and prepends the weather info to the results.
+
+    Returns:
+        Formatted search results string, or error message if the search fails.
+    """
     data = urllib.parse.urlencode({"q": query}).encode("utf-8")
     req = urllib.request.Request(
         DDG_URL,
@@ -156,6 +176,19 @@ def search_web(query: str) -> str:
 
 
 def chat(messages: list[dict[str, str]], session_id: str) -> str:
+    """Send a chat request to Ollama and return the model's response.
+
+    Args:
+        messages: list of message dicts with "role" ("system" | "user" | "assistant")
+                  and "content" keys.
+        session_id: unique session identifier for the conversation.
+
+    Returns:
+        The model's response content.
+
+    Raises:
+        URLError, KeyError, or json.JSONDecodeError if the request fails.
+    """
     payload = json.dumps(
         {
             "model": MODEL,
@@ -179,7 +212,25 @@ def chat(messages: list[dict[str, str]], session_id: str) -> str:
 
 
 def main() -> None:
+    """Main entry point for the interactive CLI agent.
+
+    Runs an infinite loop prompting for user input, sending the full conversation
+    history to Ollama, and displaying the assistant's response.
+
+    The loop exits on:
+      - empty prompt (just press Enter)
+      - /q command
+      - Ctrl+C
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
     session_id = uuid.uuid4().hex
+    # Initialize conversation with system prompt and at least one dummy message
+    # to ensure context is available on first user input
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
@@ -194,13 +245,16 @@ def main() -> None:
                 print()
                 break
 
+            # Exit conditions: empty input or /q command
             if not line or line.strip() == "/q":
                 break
 
+            # Add user message to conversation history
             messages.append({"role": "user", "content": line})
 
             print("Thinking...", flush=True)
 
+            # Get response from Ollama model with full history context
             try:
                 reply = chat(messages, session_id)
             except urllib.error.URLError as e:
@@ -210,14 +264,20 @@ def main() -> None:
                 print(f"Error: unexpected response from Ollama ({e})")
                 break
 
+            # Assistant's reply
+            messages.append({"role": "assistant", "content": reply})
+
+            # Check if the reply contains a [SEARCH: query] pattern
             match = SEARCH_RE.search(reply)
             if match:
                 query = match.group(1)
                 ddg_url = DDG_URL + "?" + urllib.parse.urlencode({"q": query})
-                print(f"[search] {query}", flush=True)
-                print(f"[url]    {ddg_url}", flush=True)
+                # print(f"[search] {query}", flush=True)
+                # print(f"[url]    {ddg_url}", flush=True)
                 search_results = search_web(query)
-                print(f"[results] {search_results}", flush=True)
+                # print(f"[results] {search_results}", flush=True)
+                # Append both the original reply (with search trigger) and
+                # the search results to history, then regenerate response
                 messages.append({"role": "assistant", "content": reply})
                 messages.append({"role": "user", "content": search_results})
                 try:
@@ -229,9 +289,13 @@ def main() -> None:
                     print(f"Error: unexpected response from Ollama ({e})")
                     break
 
+            # Add final assistant reply to history and trim to HISTORY_LIMIT
             messages.append({"role": "assistant", "content": reply})
 
-            print(messages)  # ??????????????????
+            # Debug: print full message history (uncomment to inspect)
+            # print(messages)
+
+            # Enforce history limit by dropping oldest messages after index 1
             if len(messages) > HISTORY_LIMIT:
                 messages = [messages[0]] + messages[-(HISTORY_LIMIT - 1) :]
 

@@ -42,6 +42,14 @@ The interactive loop is exercised by a test that emulates a TTY (via `pty`) agai
 python3 test_agent.py
 ```
 
+## How to debug 
+
+- start app in debug mode executing `run_debug.sh `
+- open agent.py  
+- open dap_ui 
+- set breakpoint 
+- start new dap session 
+
 ## License
 
 MIT

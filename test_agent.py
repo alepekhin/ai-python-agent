@@ -31,10 +31,12 @@ FAKE_DDG_HTML = """\
 
 class FakeOllamaHandler(http.server.BaseHTTPRequestHandler):
     responses: typing.ClassVar[list[str]] = ["REPLY"]
+    requests: typing.ClassVar[list[list[dict[str, str]]]] = []
 
     def do_POST(self) -> None:
         content_length = int(self.headers.get("Content-Length", 0))
-        self.rfile.read(content_length)
+        raw = self.rfile.read(content_length)
+        FakeOllamaHandler.requests.append(json.loads(raw.decode("utf-8"))["messages"])
         body = json.dumps({"message": {"content": self.responses[0]}}).encode("utf-8")
         if len(self.responses) > 1:
             self.responses.pop(0)
@@ -108,6 +110,7 @@ class AgentTTYTest(unittest.TestCase):
         agent.MODEL = "test-model"
         if responses is not None:
             FakeOllamaHandler.responses = list(responses)
+        FakeOllamaHandler.requests = []
         sys.stdout.reconfigure(line_buffering=True)
 
         output: bytes = b""
@@ -192,6 +195,30 @@ class AgentTTYTest(unittest.TestCase):
         )
         self.assertIn("[search] topic x", output)
         self.assertIn("Assistant: Here is what I found.", output)
+
+    def _last_user_prompts(self) -> list[str]:
+        return [
+            m["content"] for m in FakeOllamaHandler.requests[-1] if m["role"] == "user"
+        ]
+
+    @unittest.skipIf(agent.readline is None, "readline is not available")
+    def test_up_arrow_repeats_previous_command(self) -> None:
+        output = self._run_agent(["hello", "\x1b[A", ""], responses=["ONE", "TWO"])
+        self.assertIn("Assistant: ONE", output)
+        self.assertIn("Assistant: TWO", output)
+        self.assertIn("Bye!", output)
+        self.assertEqual(len(FakeOllamaHandler.requests), 2)
+        self.assertEqual(self._last_user_prompts(), ["hello", "hello"])
+
+    @unittest.skipIf(agent.readline is None, "readline is not available")
+    def test_down_arrow_returns_to_empty_input(self) -> None:
+        output = self._run_agent(
+            ["hello", "\x1b[A\x1b[B", ""], responses=["ONE", "TWO"]
+        )
+        self.assertIn("Assistant: ONE", output)
+        self.assertIn("Bye!", output)
+        self.assertEqual(len(FakeOllamaHandler.requests), 1)
+        self.assertNotIn("Assistant: TWO", output)
 
 
 if __name__ == "__main__":

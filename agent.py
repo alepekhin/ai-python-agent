@@ -9,6 +9,11 @@ import urllib.parse
 import urllib.request
 import uuid
 
+try:  # readline is POSIX-only, may be missing on Windows or embedded builds
+    import readline
+except ImportError:
+    readline = None  # type: ignore[assignment]
+
 # Configuration: model, API endpoint, history limit, search service
 MODEL: str = "carstenuhlig/omnicoder-2-9b:latest"
 OLLAMA_URL: str = "http://localhost:11434/api/chat"
@@ -211,6 +216,42 @@ def chat(messages: list[dict[str, str]], session_id: str) -> str:
     return data["message"]["content"]
 
 
+def init_input_history() -> None:
+    """Enable readline line editing and cap the command history.
+
+    With readline available, Up/Down arrows walk through previously submitted
+    prompts. History is kept in memory for the current session only and is
+    limited to HISTORY_LIMIT entries.
+    """
+    if readline is None:
+        return
+    readline.set_history_length(HISTORY_LIMIT)
+
+
+def read_prompt(prompt: str = "You: ") -> str:
+    """Read one line from stdin, recording it in the command history.
+
+    Args:
+        prompt: text shown before the input cursor.
+
+    Returns:
+        The entered line, or an empty string on EOF (Ctrl+D) or Ctrl+C.
+    """
+    try:
+        line = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+    # Remember accepted commands, skipping blanks, the quit command and
+    # immediate repeats (Up + Enter) so history stays free of duplicates.
+    if readline is not None and line.strip() and line.strip() != "/q":
+        length = readline.get_current_history_length()
+        if not length or readline.get_history_item(length) != line:
+            readline.add_history(line)
+    return line
+
+
 def main() -> None:
     """Main entry point for the interactive CLI agent.
 
@@ -222,6 +263,8 @@ def main() -> None:
       - /q command
       - Ctrl+C
 
+    Up/Down arrows recall previously entered commands when readline is available.
+
     Args:
         None
 
@@ -229,6 +272,7 @@ def main() -> None:
         None
     """
     session_id = uuid.uuid4().hex
+    init_input_history()
     # Initialize conversation with system prompt and at least one dummy message
     # to ensure context is available on first user input
     messages: list[dict[str, str]] = [
@@ -239,11 +283,7 @@ def main() -> None:
 
     try:
         while True:
-            try:
-                line = input("You: ")
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
+            line = read_prompt()
 
             # Exit conditions: empty input or /q command
             if not line or line.strip() == "/q":
@@ -271,11 +311,8 @@ def main() -> None:
             match = SEARCH_RE.search(reply)
             if match:
                 query = match.group(1)
-                ddg_url = DDG_URL + "?" + urllib.parse.urlencode({"q": query})
-                # print(f"[search] {query}", flush=True)
-                # print(f"[url]    {ddg_url}", flush=True)
+                print(f"[search] {query}", flush=True)
                 search_results = search_web(query)
-                # print(f"[results] {search_results}", flush=True)
                 # Append both the original reply (with search trigger) and
                 # the search results to history, then regenerate response
                 messages.append({"role": "assistant", "content": reply})

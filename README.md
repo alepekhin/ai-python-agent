@@ -16,6 +16,8 @@ python3 agent.py
 
 Type your prompt and press Enter. The agent sends the full conversation history to the model, so it remembers earlier turns. End the dialog by pressing Enter on an empty prompt (or typing `/q`, or pressing Ctrl+C).
 
+Press Up/Down to walk through the commands you already entered in this session and repeat one (standard readline editing, so Ctrl+A/E/K and other shortcuts work too). The command history lives in memory only and is cleared when the agent exits.
+
 Example session:
 
 ```

@@ -16,7 +16,7 @@ python3 agent.py
 
 Type your prompt and press Enter. The agent sends the full conversation history to the model, so it remembers earlier turns. End the dialog by pressing Enter on an empty prompt (or typing `/q`, or pressing Ctrl+C).
 
-Press Up/Down to walk through the commands you already entered in this session and repeat one (standard readline editing, so Ctrl+A/E/K and other shortcuts work too). The command history lives in memory only and is cleared when the agent exits.
+Press Up/Down to walk through the commands you already entered and repeat one (standard readline editing, so Ctrl+A/E/K and other shortcuts work too). The command history is saved to `~/.local/share/ai-python-agent/history` when the agent exits, so prompts from previous sessions are also available with the Up arrow; the last `HISTORY_LIMIT` (32) entries are kept. Set `HISTORY_FILE` in `agent.py` to store it elsewhere.
 
 Example session:
 
@@ -35,6 +35,7 @@ Bye!
 - The full message history is sent to Ollama's `/api/chat` endpoint on each turn, so the model has the previous context.
 - The history is capped at `HISTORY_LIMIT` (32) messages (`agent.py:9`), dropping the oldest turns so the prompt stays within the model's context length.
 - The model URL and name are configurable via the `OLLAMA_URL` and `MODEL` constants at the top of `agent.py`.
+- Prompts are persisted to `HISTORY_FILE` (`~/.local/share/ai-python-agent/history`): loaded on start, saved on exit, capped at `HISTORY_LIMIT` entries.
 
 ## Tests
 

@@ -5,6 +5,7 @@ import os
 import pty
 import select
 import sys
+import tempfile
 import threading
 import time
 import typing
@@ -92,7 +93,21 @@ class AgentTTYTest(unittest.TestCase):
         cls.ddg_server.shutdown()
         cls.ddg_server.server_close()
 
-    def _run_agent(self, lines: list[str], responses: list[str] | None = None) -> str:
+    def setUp(self) -> None:
+        # Point the persisted history at a throwaway file, so tests never read
+        # or write the real one in the user's home directory.
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        agent.HISTORY_FILE = str(Path(self.tmpdir.name) / "state" / "history")
+        if agent.readline is not None:
+            agent.readline.clear_history()
+            self.addCleanup(agent.readline.clear_history)
+
+    def _run_agent(
+        self,
+        lines: list[str],
+        responses: list[str] | None = None,
+    ) -> str:
         master, slave = pty.openpty()
         saved_stdin: int = os.dup(0)
         saved_stdout: int = os.dup(1)
@@ -219,6 +234,32 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("Bye!", output)
         self.assertEqual(len(FakeOllamaHandler.requests), 1)
         self.assertNotIn("Assistant: TWO", output)
+
+    @unittest.skipIf(agent.readline is None, "readline is not available")
+    def test_prompts_persisted_for_next_session(self) -> None:
+        self._run_agent(["hello", ""])
+        history = Path(agent.HISTORY_FILE).read_text(encoding="utf-8")
+        self.assertIn("hello", history)
+
+    @unittest.skipIf(agent.readline is None, "readline is not available")
+    def test_up_arrow_recalls_prompt_from_previous_session(self) -> None:
+        Path(agent.HISTORY_FILE).parent.mkdir(parents=True, exist_ok=True)
+        Path(agent.HISTORY_FILE).write_text("prompt from last time\n", encoding="utf-8")
+        output = self._run_agent(["\x1b[A", ""], responses=["REPLY"])
+        self.assertIn("Assistant: REPLY", output)
+        self.assertIn("Bye!", output)
+        self.assertEqual(self._last_user_prompts(), ["prompt from last time"])
+
+    @unittest.skipIf(agent.readline is None, "readline is not available")
+    def test_history_file_capped_to_limit(self) -> None:
+        Path(agent.HISTORY_FILE).parent.mkdir(parents=True, exist_ok=True)
+        stored = "".join(f"old prompt {i}\n" for i in range(agent.HISTORY_LIMIT + 5))
+        Path(agent.HISTORY_FILE).write_text(stored, encoding="utf-8")
+        agent.load_input_history()
+        length = agent.readline.get_current_history_length()
+        history = [agent.readline.get_history_item(i + 1) for i in range(length)]
+        self.assertEqual(len(history), agent.HISTORY_LIMIT)
+        self.assertEqual(history[-1], f"old prompt {agent.HISTORY_LIMIT + 4}")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
 
 try:  # readline is POSIX-only, may be missing on Windows or embedded builds
     import readline
@@ -18,6 +19,9 @@ except ImportError:
 MODEL: str = "carstenuhlig/omnicoder-2-9b:latest"
 OLLAMA_URL: str = "http://localhost:11434/api/chat"
 HISTORY_LIMIT: int = 32  # cap history to stay within model context
+HISTORY_FILE: str = str(
+    Path.home() / ".local" / "share" / "ai-python-agent" / "history"
+)
 DDG_URL: str = "https://html.duckduckgo.com/html/"
 SEARCH_RE: re.Pattern[str] = re.compile(r"\[SEARCH:\s*(.+?)\]")
 
@@ -217,15 +221,50 @@ def chat(messages: list[dict[str, str]], session_id: str) -> str:
 
 
 def init_input_history() -> None:
-    """Enable readline line editing and cap the command history.
+    """Enable readline line editing and restore prompts from previous sessions.
 
     With readline available, Up/Down arrows walk through previously submitted
-    prompts. History is kept in memory for the current session only and is
-    limited to HISTORY_LIMIT entries.
+    prompts. The history is loaded from HISTORY_FILE, so prompts entered in
+    earlier runs of the agent are available too, and is limited to
+    HISTORY_LIMIT entries.
     """
     if readline is None:
         return
     readline.set_history_length(HISTORY_LIMIT)
+    load_input_history()
+
+
+def load_input_history() -> None:
+    """Load prompts from previous sessions into the readline history.
+
+    Reads HISTORY_FILE, keeping only the most recent HISTORY_LIMIT entries.
+    A missing or unreadable file is not an error: the agent simply starts
+    with an empty history.
+    """
+    if readline is None:
+        return
+    try:
+        readline.read_history_file(HISTORY_FILE)
+    except OSError:
+        return
+    # Older files may hold more entries than the cap: drop the oldest ones.
+    while readline.get_current_history_length() > HISTORY_LIMIT:
+        readline.remove_history_item(0)
+
+
+def save_input_history() -> None:
+    """Persist the prompt history for the next session.
+
+    Writes HISTORY_FILE, creating its directory when needed. Failures are
+    ignored: losing the history must never break the agent.
+    """
+    if readline is None:
+        return
+    try:
+        Path(HISTORY_FILE).parent.mkdir(parents=True, exist_ok=True)
+        readline.write_history_file(HISTORY_FILE)
+    except OSError:
+        pass
 
 
 def read_prompt(prompt: str = "You: ") -> str:
@@ -263,7 +302,8 @@ def main() -> None:
       - /q command
       - Ctrl+C
 
-    Up/Down arrows recall previously entered commands when readline is available.
+    Up/Down arrows recall previously entered commands, including prompts from
+    earlier sessions, when readline is available.
 
     Args:
         None
@@ -338,6 +378,7 @@ def main() -> None:
 
             print(f"Assistant: {reply}\n")
     finally:
+        save_input_history()
         print("Bye!")
 
 

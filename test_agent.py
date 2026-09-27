@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import contextlib
 import http.server
 import json
 import os
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import typing
 import unittest
 from pathlib import Path
@@ -66,6 +68,88 @@ class FakeDDGHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class BrokenModule(types.ModuleType):
+    """Module that raises ImportError on any attribute access, as if missing."""
+
+    def __getattr__(self, name: str) -> typing.Any:
+        raise ImportError(f"No module named {self.__name__!r}")
+
+
+class FakeWhisperSegment:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+@contextlib.contextmanager
+def fake_voice_modules(
+    text: str, broken: tuple[str, ...] = (), mic_error: bool = False
+) -> typing.Iterator[dict[str, typing.Any]]:
+    """Install fake sounddevice/faster_whisper modules for the duration.
+
+    Args:
+        text: transcription the fake Whisper model should return.
+        broken: module names to fake as not installed.
+        mic_error: make opening the microphone fail.
+
+    Yields:
+        A dict recording the fake model name and the transcribed audio.
+    """
+    import numpy as np
+
+    calls: dict[str, typing.Any] = {"model": None, "transcribed": []}
+
+    class PortAudioError(Exception):
+        pass
+
+    class RawInputStream:
+        def __init__(self, **kwargs: typing.Any) -> None:
+            self.kwargs = kwargs
+
+        def __enter__(self) -> typing.Self:
+            if mic_error:
+                raise PortAudioError("no default input device")
+            blocksize = self.kwargs["blocksize"]
+            self.kwargs["callback"](
+                np.zeros((blocksize, 1), dtype="float32"), blocksize, None, None
+            )
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    class WhisperModel:
+        def __init__(self, name: str, **kwargs: typing.Any) -> None:
+            calls["model"] = name
+
+        def transcribe(
+            self, audio: typing.Any, **kwargs: typing.Any
+        ) -> tuple[list[typing.Any], object]:
+            calls["transcribed"].append((len(audio), kwargs))
+            return [FakeWhisperSegment(text)], object()
+
+    sounddevice = types.ModuleType("sounddevice")
+    sounddevice.RawInputStream = RawInputStream  # type: ignore[attr-defined]
+    sounddevice.PortAudioError = PortAudioError  # type: ignore[attr-defined]
+    faster_whisper = types.ModuleType("faster_whisper")
+    faster_whisper.WhisperModel = WhisperModel  # type: ignore[attr-defined]
+
+    fakes = {"sounddevice": sounddevice, "faster_whisper": faster_whisper}
+    saved = {name: sys.modules.get(name) for name in fakes}
+    for name, fake in fakes.items():
+        sys.modules[name] = BrokenModule(name) if name in broken else fake
+
+    agent.load_whisper.cache_clear()
+    try:
+        yield calls
+    finally:
+        agent.load_whisper.cache_clear()
+        for name, module in saved.items():
+            if module is None:
+                del sys.modules[name]
+            else:
+                sys.modules[name] = module
+
+
 class AgentTTYTest(unittest.TestCase):
     server: http.server.HTTPServer
     ddg_server: http.server.HTTPServer
@@ -107,7 +191,17 @@ class AgentTTYTest(unittest.TestCase):
         self,
         lines: list[str],
         responses: list[str] | None = None,
+        markers: list[bytes | None] | None = None,
     ) -> str:
+        """Run the agent on a pty, feeding it `lines` one by one.
+
+        Args:
+            lines: text written to the pty before each expected marker.
+            responses: canned Ollama replies, one per request.
+            markers: output to wait for before writing each line, defaults
+                     to the "You: " prompt for every line. None writes the
+                     line right away, for input typed ahead of the prompt.
+        """
         master, slave = pty.openpty()
         saved_stdin: int = os.dup(0)
         saved_stdout: int = os.dup(1)
@@ -129,11 +223,12 @@ class AgentTTYTest(unittest.TestCase):
         sys.stdout.reconfigure(line_buffering=True)
 
         output: bytes = b""
+        searched: int = 0  # only look at output produced after the last match
 
         def wait_for(needle: bytes, timeout: float = 15) -> None:
-            nonlocal output
+            nonlocal output, searched
             deadline = time.time() + timeout
-            while needle not in output:
+            while needle not in output[searched:]:
                 if time.time() > deadline:
                     raise AssertionError(
                         f"timed out waiting for {needle!r}; got {output!r}"
@@ -147,12 +242,15 @@ class AgentTTYTest(unittest.TestCase):
                             f"pty closed while waiting for {needle!r}; got {output!r}"
                         )
                     output += chunk
+            searched = output.index(needle, searched) + len(needle)
 
         try:
             t = threading.Thread(target=agent.main, daemon=True)
             t.start()
-            for line in lines:
-                wait_for(b"You: ")
+            for i, line in enumerate(lines):
+                marker = markers[i] if markers is not None else b"You: "
+                if marker is not None:
+                    wait_for(marker)
                 time.sleep(0.1)
                 os.write(master, (line + "\n").encode("utf-8"))
             wait_for(b"Bye!")
@@ -227,8 +325,12 @@ class AgentTTYTest(unittest.TestCase):
 
     @unittest.skipIf(agent.readline is None, "readline is not available")
     def test_down_arrow_returns_to_empty_input(self) -> None:
+        # Walking up and back down leaves the input empty, so the agent exits
+        # and never shows a third prompt: the last line is typed ahead.
         output = self._run_agent(
-            ["hello", "\x1b[A\x1b[B", ""], responses=["ONE", "TWO"]
+            ["hello", "\x1b[A\x1b[B", ""],
+            responses=["ONE", "TWO"],
+            markers=[b"You: ", b"Assistant: ONE", None],
         )
         self.assertIn("Assistant: ONE", output)
         self.assertIn("Bye!", output)
@@ -260,6 +362,60 @@ class AgentTTYTest(unittest.TestCase):
         history = [agent.readline.get_history_item(i + 1) for i in range(length)]
         self.assertEqual(len(history), agent.HISTORY_LIMIT)
         self.assertEqual(history[-1], f"old prompt {agent.HISTORY_LIMIT + 4}")
+
+    def test_voice_prompt_is_transcribed_and_sent(self) -> None:
+        with fake_voice_modules("tell me a joke") as calls:
+            output = self._run_agent(
+                [agent.VOICE_COMMAND, "", ""],
+                responses=["REPLY"],
+                markers=[b"You: ", b"Recording...", b"You: "],
+            )
+        self.assertIn("Recording... press Enter to stop", output)
+        self.assertIn("You (voice): tell me a joke", output)
+        self.assertIn("Assistant: REPLY", output)
+        self.assertIn("Bye!", output)
+        self.assertEqual(calls["model"], agent.WHISPER_MODEL)
+        self.assertEqual(self._last_user_prompts(), ["tell me a joke"])
+
+    @unittest.skipIf(agent.readline is None, "readline is not available")
+    def test_voice_prompt_kept_in_input_history(self) -> None:
+        with fake_voice_modules("remember me"):
+            self._run_agent(
+                [agent.VOICE_COMMAND, "", ""],
+                responses=["REPLY"],
+                markers=[b"You: ", b"Recording...", b"You: "],
+            )
+        history = Path(agent.HISTORY_FILE).read_text(encoding="utf-8")
+        self.assertIn("remember me", history)
+
+    def test_voice_prompt_without_packages_reports_error(self) -> None:
+        with fake_voice_modules("", broken=("sounddevice", "faster_whisper")):
+            output = self._run_agent(
+                [agent.VOICE_COMMAND, "hello", ""], responses=["REPLY"]
+            )
+        self.assertIn("pip install faster-whisper sounddevice", output)
+        self.assertIn("Assistant: REPLY", output)
+        # The failed voice prompt is not sent, the dialog keeps working.
+        self.assertEqual(self._last_user_prompts(), ["hello"])
+
+    def test_voice_prompt_with_broken_microphone_reports_error(self) -> None:
+        with fake_voice_modules("", mic_error=True):
+            output = self._run_agent(
+                [agent.VOICE_COMMAND, "hello", ""], responses=["REPLY"]
+            )
+        self.assertIn("no default input device", output)
+        self.assertIn("Assistant: REPLY", output)
+        self.assertEqual(self._last_user_prompts(), ["hello"])
+
+    def test_silent_voice_prompt_is_ignored(self) -> None:
+        with fake_voice_modules(""):
+            output = self._run_agent(
+                [agent.VOICE_COMMAND, "", "hello", ""],
+                markers=[b"You: ", b"Recording...", b"You: ", b"You: "],
+            )
+        self.assertIn("Nothing recognized", output)
+        self.assertIn("Assistant: REPLY", output)
+        self.assertEqual(self._last_user_prompts(), ["hello"])
 
 
 if __name__ == "__main__":

@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """Interactive CLI AI agent with conversation history and web search via Ollama."""
 
+import functools
 import html
 import json
 import re
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Any
 
 try:  # readline is POSIX-only, may be missing on Windows or embedded builds
     import readline
 except ImportError:
     readline = None  # type: ignore[assignment]
+
+try:  # termios/tty are POSIX-only and needed to read a bare Enter keypress
+    import termios
+    import tty
+except ImportError:
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 # Configuration: model, API endpoint, history limit, search service
 MODEL: str = "carstenuhlig/omnicoder-2-9b:latest"
@@ -44,6 +54,15 @@ WEATHER_RE: re.Pattern[str] = re.compile(
     r"\b(weather|temperature|forecast|rain|snow|wind|humid|cloud|sunny|storm)\b",
     re.IGNORECASE,
 )
+
+VOICE_COMMAND: str = "/v"  # type the prompt instead of typing it
+WHISPER_MODEL: str = "base"  # tiny, base, small, medium, large-v3
+WHISPER_DEVICE: str = "cpu"  # "cuda" to use a GPU
+WHISPER_COMPUTE_TYPE: str = "int8"  # "float16" on GPU, "int8" for small RAM use
+WHISPER_LANGUAGE: str | None = None  # None detects the language automatically
+VOICE_SAMPLE_RATE: int = 16000  # sample rate required by Whisper
+VOICE_BLOCK_MS: int = 100  # microphone read block size
+VOICE_HINT: str = "Voice input needs faster-whisper and sounddevice: pip install faster-whisper sounddevice"
 
 
 def _get_weather(location: str) -> str:
@@ -282,13 +301,170 @@ def read_prompt(prompt: str = "You: ") -> str:
         print()
         return ""
 
-    # Remember accepted commands, skipping blanks, the quit command and
-    # immediate repeats (Up + Enter) so history stays free of duplicates.
-    if readline is not None and line.strip() and line.strip() != "/q":
-        length = readline.get_current_history_length()
-        if not length or readline.get_history_item(length) != line:
-            readline.add_history(line)
+    remember_prompt(line)
     return line
+
+
+def remember_prompt(line: str) -> None:
+    """Add a submitted prompt to the readline history.
+
+    Blank lines, the quit command and immediate repeats (Up + Enter) are
+    skipped, so the history stays free of noise.
+
+    Args:
+        line: the prompt to remember, as typed or transcribed.
+
+    Returns:
+        None
+    """
+    if readline is None:
+        return
+    if not line.strip() or line.strip() == "/q":
+        return
+    length = readline.get_current_history_length()
+    if not length or readline.get_history_item(length) != line:
+        readline.add_history(line)
+
+
+@functools.cache
+def load_whisper() -> Any:
+    """Load the faster-whisper model, reusing it on later calls.
+
+    The model is downloaded on the first call and cached on disk, so
+    following calls (and later sessions) work without internet access.
+
+    Returns:
+        A faster_whisper.WhisperModel instance.
+
+    Raises:
+        ImportError: if faster-whisper is not installed.
+    """
+    from faster_whisper import WhisperModel
+
+    return WhisperModel(
+        WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
+    )
+
+
+def wait_for_enter() -> None:
+    """Block until Enter is pressed, with terminal echo turned off.
+
+    The terminal is switched to cbreak mode, so a single keypress is
+    delivered without waiting for a newline while Ctrl+C keeps working.
+    When terminal control is unavailable the call falls back to reading a
+    whole line.
+
+    Returns:
+        None
+    """
+    if termios is None or tty is None:
+        sys.stdin.readline()
+        return
+    fd = sys.stdin.fileno()
+    try:
+        saved = termios.tcgetattr(fd)
+    except termios.error:  # not a terminal (e.g. piped input)
+        sys.stdin.readline()
+        return
+    try:
+        tty.setcbreak(fd)
+        while True:
+            char = sys.stdin.buffer.read(1)
+            if char in (b"", b"\r", b"\n"):  # Enter, or end of input
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def record_voice() -> Any:
+    """Record mono 16 kHz audio from the default microphone until Enter.
+
+    Returns:
+        A numpy float32 array with the recorded samples, empty if nothing
+        was captured.
+
+    Raises:
+        ImportError: if sounddevice is not installed.
+        OSError: if the microphone cannot be opened.
+    """
+    import numpy as np
+    import sounddevice as sd
+
+    blocks: list[Any] = []
+
+    def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
+        # A raw stream hands out a buffer over memory that PortAudio reuses
+        # for the next block, so the samples have to be copied out.
+        blocks.append(np.frombuffer(indata, dtype="float32").copy())
+
+    block_size = int(VOICE_SAMPLE_RATE * VOICE_BLOCK_MS / 1000)
+    try:
+        with sd.RawInputStream(
+            samplerate=VOICE_SAMPLE_RATE,
+            blocksize=block_size,
+            dtype="float32",
+            channels=1,
+            callback=callback,
+        ):
+            print("Recording... press Enter to stop, Ctrl+C to cancel", flush=True)
+            wait_for_enter()
+    except sd.PortAudioError as e:
+        raise OSError(f"cannot open microphone: {e}") from e
+
+    if not blocks:
+        return np.empty(0, dtype="float32")
+    return np.concatenate(blocks)
+
+
+def transcribe_voice(audio: Any) -> str:
+    """Transcribe recorded audio with faster-whisper.
+
+    Args:
+        audio: mono float32 samples at VOICE_SAMPLE_RATE, as returned by
+               record_voice().
+
+    Returns:
+        The recognized text, stripped of surrounding whitespace.
+    """
+    segments, _ = load_whisper().transcribe(
+        audio, language=WHISPER_LANGUAGE, vad_filter=True
+    )
+    return "".join(segment.text for segment in segments).strip()
+
+
+def voice_prompt() -> str:
+    """Record a prompt by voice and return its transcription.
+
+    Handles a missing microphone, missing packages and Ctrl+C, reporting
+    them to the user instead of raising, so the dialog can continue.
+
+    Returns:
+        The transcribed prompt, or an empty string if nothing was captured.
+    """
+    try:
+        audio = record_voice()
+        seconds = len(audio) / VOICE_SAMPLE_RATE
+        if not seconds:
+            print("Nothing recorded.", flush=True)
+            return ""
+        print(f"Recorded {seconds:.1f}s, transcribing...", flush=True)
+        text = transcribe_voice(audio)
+    except ImportError as e:
+        print(f"Error: {VOICE_HINT} (missing: {e.name})")
+        return ""
+    except KeyboardInterrupt:
+        print("\nRecording cancelled.")
+        return ""
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"Error: voice input failed ({e})")
+        return ""
+
+    if not text:
+        print("Nothing recognized, try again.", flush=True)
+        return ""
+    print(f"You (voice): {text}")
+    remember_prompt(text)
+    return text
 
 
 def main() -> None:
@@ -303,7 +479,8 @@ def main() -> None:
       - Ctrl+C
 
     Up/Down arrows recall previously entered commands, including prompts from
-    earlier sessions, when readline is available.
+    earlier sessions, when readline is available. Typing /v instead of a prompt
+    records it from the microphone and sends the transcription to the model.
 
     Args:
         None
@@ -319,6 +496,7 @@ def main() -> None:
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
     print(f"AI agent — using model: {MODEL}")
+    print(f"Type {VOICE_COMMAND} to speak your prompt.")
     print("Press Enter with an empty prompt to exit.\n")
 
     try:
@@ -328,6 +506,12 @@ def main() -> None:
             # Exit conditions: empty input or /q command
             if not line or line.strip() == "/q":
                 break
+
+            # Voice prompt: replace the typed command with its transcription
+            if line.strip() == VOICE_COMMAND:
+                line = voice_prompt()
+                if not line:
+                    continue
 
             # Add user message to conversation history
             messages.append({"role": "user", "content": line})

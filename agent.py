@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Interactive CLI AI agent with conversation history and web search via Ollama."""
 
+import base64
 import functools
 import html
+import io
 import json
 import re
 import sys
@@ -10,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +29,11 @@ except ImportError:
     tty = None  # type: ignore[assignment]
 
 # Configuration: model, API endpoint, history limit, search service
-MODEL: str = "carstenuhlig/omnicoder-2-9b:latest"
-OLLAMA_URL: str = "http://localhost:11434/api/chat"
+MODEL: str = "gemma4:latest"
+# The OpenAI-compatible endpoint, not /api/chat: it is the only one that
+# accepts an audio prompt, which the model transcribes on its own.
+OLLAMA_URL: str = "http://localhost:11434/v1/chat/completions"
+OLLAMA_TIMEOUT: int = 300  # audio prompts make the model think before answering
 HISTORY_LIMIT: int = 32  # cap history to stay within model context
 HISTORY_FILE: str = str(
     Path.home() / ".local" / "share" / "ai-python-agent" / "history"
@@ -56,13 +62,35 @@ WEATHER_RE: re.Pattern[str] = re.compile(
 )
 
 VOICE_COMMAND: str = "/v"  # type the prompt instead of typing it
-WHISPER_MODEL: str = "base"  # tiny, base, small, medium, large-v3
-WHISPER_DEVICE: str = "cpu"  # "cuda" to use a GPU
-WHISPER_COMPUTE_TYPE: str = "int8"  # "float16" on GPU, "int8" for small RAM use
-WHISPER_LANGUAGE: str | None = None  # None detects the language automatically
-VOICE_SAMPLE_RATE: int = 16000  # sample rate required by Whisper
+VOICE_SAMPLE_RATE: int = 16000  # sample rate of the WAV sent to the model
 VOICE_BLOCK_MS: int = 100  # microphone read block size
-VOICE_HINT: str = "Voice input needs faster-whisper and sounddevice: pip install faster-whisper sounddevice"
+VOICE_HINT: str = "Voice input needs sounddevice: pip install sounddevice"
+# The model transcribes the recording itself, so it is only asked to write
+# down what it hears, and thinking is off so the reply is short and quick.
+TRANSCRIBE_PROMPT: str = "Transcribe the audio. Output the transcription only."
+
+SPEAK_COMMAND: str = "/s"  # toggle spoken replies
+# One Piper voice per language, picked automatically from the reply's script.
+# Any name from `python -m piper.download_voices` works.
+PIPER_VOICE_EN: str = "en_US-lessac-medium"
+PIPER_VOICE_RU: str = "ru_RU-denis-medium"
+PIPER_USE_CUDA: bool = False  # "cuda" needs onnxruntime-gpu, keep False on CPU
+TTS_DIR: str = str(Path.home() / ".local" / "share" / "ai-python-agent" / "voices")
+TTS_MAX_CHARS: int = 1200  # speak at most this much of a long reply, ~1 minute
+TTS_HINT: str = (
+    "Voice output needs piper-tts and sounddevice: pip install piper-tts sounddevice"
+)
+
+CODE_BLOCK_RE: re.Pattern[str] = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
+MARKDOWN_LINK_RE: re.Pattern[str] = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+URL_RE: re.Pattern[str] = re.compile(r"(?:https?://|www\.)\S+")
+MARKUP_RE: re.Pattern[str] = re.compile(r"[*_#>~|\[\]]")
+CYRILLIC_RE: re.Pattern[str] = re.compile(r"[Ѐ-ӿ]")
+LATIN_RE: re.Pattern[str] = re.compile(r"[A-Za-z]")
+
+# Voice and the word spoken in place of a URL, per detected language.
+TTS_VOICES: dict[str, str] = {"en": PIPER_VOICE_EN, "ru": PIPER_VOICE_RU}
+TTS_LINK_WORDS: dict[str, str] = {"en": "link", "ru": "ссылка"}
 
 
 def _get_weather(location: str) -> str:
@@ -233,10 +261,10 @@ def chat(messages: list[dict[str, str]], session_id: str) -> str:
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
-    return data["message"]["content"]
+    return data["choices"][0]["message"]["content"]
 
 
 def init_input_history() -> None:
@@ -326,26 +354,6 @@ def remember_prompt(line: str) -> None:
         readline.add_history(line)
 
 
-@functools.cache
-def load_whisper() -> Any:
-    """Load the faster-whisper model, reusing it on later calls.
-
-    The model is downloaded on the first call and cached on disk, so
-    following calls (and later sessions) work without internet access.
-
-    Returns:
-        A faster_whisper.WhisperModel instance.
-
-    Raises:
-        ImportError: if faster-whisper is not installed.
-    """
-    from faster_whisper import WhisperModel
-
-    return WhisperModel(
-        WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
-    )
-
-
 def wait_for_enter() -> None:
     """Block until Enter is pressed, with terminal echo turned off.
 
@@ -416,8 +424,42 @@ def record_voice() -> Any:
     return np.concatenate(blocks)
 
 
+def encode_wav(audio: Any) -> bytes:
+    """Wrap recorded samples into a WAV file held in memory.
+
+    The microphone hands out float samples, while the model wants a WAV
+    container, so the samples are scaled to signed 16-bit PCM and written
+    into a 44-byte header.
+
+    Args:
+        audio: mono float32 samples at VOICE_SAMPLE_RATE, as returned by
+               record_voice().
+
+    Returns:
+        The recording as a WAV file, ready to be sent to the model.
+
+    Raises:
+        ImportError: if numpy is not installed.
+    """
+    import numpy as np
+
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(VOICE_SAMPLE_RATE)
+        wav.writeframes(pcm.tobytes())
+    return buffer.getvalue()
+
+
 def transcribe_voice(audio: Any) -> str:
-    """Transcribe recorded audio with faster-whisper.
+    """Let the model transcribe the recording, by sending it the WAV itself.
+
+    The audio is attached to a single request as an `input_audio` block, so
+    no local speech recognition is involved. The reply of that request is
+    the transcript, which then takes the place of the recording in the
+    conversation history.
 
     Args:
         audio: mono float32 samples at VOICE_SAMPLE_RATE, as returned by
@@ -425,18 +467,51 @@ def transcribe_voice(audio: Any) -> str:
 
     Returns:
         The recognized text, stripped of surrounding whitespace.
+
+    Raises:
+        URLError, KeyError, or json.JSONDecodeError if the request fails.
     """
-    segments, _ = load_whisper().transcribe(
-        audio, language=WHISPER_LANGUAGE, vad_filter=True
+    encoded = base64.b64encode(encode_wav(audio)).decode("ascii")
+    payload = json.dumps(
+        {
+            "model": MODEL,
+            "stream": False,
+            "reasoning_effort": "none",
+            "options": {"temperature": 0},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": TRANSCRIBE_PROMPT},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": encoded, "format": "wav"},
+                        },
+                    ],
+                }
+            ],
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    return "".join(segment.text for segment in segments).strip()
+
+    with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    return data["choices"][0]["message"]["content"].strip()
 
 
 def voice_prompt() -> str:
     """Record a prompt by voice and return its transcription.
 
-    Handles a missing microphone, missing packages and Ctrl+C, reporting
-    them to the user instead of raising, so the dialog can continue.
+    Handles a missing microphone, missing packages, a model that cannot be
+    reached and Ctrl+C, reporting them to the user instead of raising, so
+    the dialog can continue.
 
     Returns:
         The transcribed prompt, or an empty string if nothing was captured.
@@ -447,7 +522,7 @@ def voice_prompt() -> str:
         if not seconds:
             print("Nothing recorded.", flush=True)
             return ""
-        print(f"Recorded {seconds:.1f}s, transcribing...", flush=True)
+        print(f"Recorded {seconds:.1f}s, transcribing with the model...", flush=True)
         text = transcribe_voice(audio)
     except ImportError as e:
         print(f"Error: {VOICE_HINT} (missing: {e.name})")
@@ -467,6 +542,148 @@ def voice_prompt() -> str:
     return text
 
 
+def detect_language(text: str) -> str:
+    """Guess the language of a reply from the script it is written in.
+
+    Russian is spoken with a Russian voice, everything else with the English
+    one. A reply that mixes both is named after the script it mostly uses, so
+    a Russian answer with a couple of English words still gets a Russian voice.
+
+    Args:
+        text: the raw assistant reply.
+
+    Returns:
+        "ru" for mostly Cyrillic text, "en" otherwise.
+    """
+    if len(CYRILLIC_RE.findall(text)) > len(LATIN_RE.findall(text)):
+        return "ru"
+    return "en"
+
+
+def speakable_text(text: str, link_word: str = "link") -> str:
+    """Turn an assistant reply into plain text a TTS voice can read out.
+
+    Code blocks are dropped and raw URLs are replaced by link_word, since a
+    voice reading them aloud is noise; inline markup is stripped and the
+    result is whitespace-collapsed and capped at TTS_MAX_CHARS, cutting on a
+    word boundary.
+
+    Args:
+        text: the raw assistant reply.
+        link_word: what to say instead of a URL, in the spoken language.
+
+    Returns:
+        The speakable part of the reply, possibly an empty string.
+    """
+    text = CODE_BLOCK_RE.sub(" ", text)
+    text = MARKDOWN_LINK_RE.sub(r"\1", text)
+    text = URL_RE.sub(f" {link_word} ", text)
+    text = text.replace("`", " ")
+    text = MARKUP_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > TTS_MAX_CHARS:
+        text = text[:TTS_MAX_CHARS].rsplit(" ", 1)[0] + ", and more."
+    return text
+
+
+@functools.cache
+def load_piper(voice: str) -> Any:
+    """Load a Piper TTS voice, reusing it on later calls.
+
+    The voice (an ONNX model plus its config) is downloaded to TTS_DIR on the
+    first call and cached on disk, so following calls (and later sessions)
+    work without internet access. Voices are cached one by one, so only the
+    languages actually spoken are downloaded.
+
+    Args:
+        voice: Piper voice name, e.g. PIPER_VOICE_EN.
+
+    Returns:
+        A piper.PiperVoice instance.
+
+    Raises:
+        ImportError: if piper-tts is not installed.
+        OSError: if the voice cannot be downloaded.
+    """
+    from piper import PiperVoice
+    from piper.download_voices import download_voice
+
+    voice_dir = Path(TTS_DIR)
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    model_path = voice_dir / f"{voice}.onnx"
+    config_path = voice_dir / f"{voice}.onnx.json"
+    if not (model_path.exists() and config_path.exists()):
+        print(f"Downloading voice {voice} (once, ~60 MB)...", flush=True)
+        download_voice(voice, voice_dir)
+    return PiperVoice.load(
+        model_path,
+        config_path=config_path,
+        use_cuda=PIPER_USE_CUDA,
+        download_dir=voice_dir,
+    )
+
+
+def speak(text: str) -> None:
+    """Read the reply out loud with Piper, in the language it is written in.
+
+    The voice matching the reply's script is used and loaded on first use.
+    Playback blocks until it finishes, so the next prompt appears only when the
+    voice is done. Ctrl+C stops the audio and leaves the dialog.
+
+    Args:
+        text: the assistant reply; only its speakable part is rendered.
+
+    Returns:
+        None
+
+    Raises:
+        ImportError: if piper-tts or sounddevice is not installed.
+        OSError, RuntimeError, ValueError: if synthesis or playback fails.
+    """
+    language = detect_language(text)
+    spoken = speakable_text(text, TTS_LINK_WORDS[language])
+    if not spoken:
+        return
+    import sounddevice as sd
+
+    chunks = list(load_piper(TTS_VOICES[language]).synthesize(spoken))
+    if not chunks:
+        return
+    try:
+        for chunk in chunks:
+            sd.play(chunk.audio_float_array, chunk.sample_rate)
+            sd.wait()
+    finally:
+        sd.stop()
+
+
+def enable_voice_output() -> bool:
+    """Turn spoken replies on and preload the default voice.
+
+    Only the default language is loaded, so enabling is quick; a voice for
+    another language is downloaded and loaded the first time it is needed.
+
+    Returns:
+        True if voice output is ready to use, False if it could not be enabled
+        (the reason is printed).
+    """
+    try:
+        import sounddevice  # noqa: F401  # verify playback is possible
+
+        load_piper(PIPER_VOICE_EN)
+    except ImportError as e:
+        print(f"Error: {TTS_HINT} (missing: {e.name})")
+        return False
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"Error: cannot enable voice output ({e})")
+        return False
+    print(
+        f"Voice output on — {PIPER_VOICE_EN} / {PIPER_VOICE_RU}, "
+        f"picked per reply. Type {SPEAK_COMMAND} again to mute."
+    )
+    return True
+
+
 def main() -> None:
     """Main entry point for the interactive CLI agent.
 
@@ -480,7 +697,10 @@ def main() -> None:
 
     Up/Down arrows recall previously entered commands, including prompts from
     earlier sessions, when readline is available. Typing /v instead of a prompt
-    records it from the microphone and sends the transcription to the model.
+    records it from the microphone, has the model transcribe the recording and
+    sends the transcript as the prompt. Typing /s toggles spoken replies: the
+    assistant's answer is then read out loud with Piper, in addition to being
+    printed.
 
     Args:
         None
@@ -495,8 +715,10 @@ def main() -> None:
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
+    speak_replies = False
     print(f"AI agent — using model: {MODEL}")
     print(f"Type {VOICE_COMMAND} to speak your prompt.")
+    print(f"Type {SPEAK_COMMAND} to hear the replies.")
     print("Press Enter with an empty prompt to exit.\n")
 
     try:
@@ -506,6 +728,16 @@ def main() -> None:
             # Exit conditions: empty input or /q command
             if not line or line.strip() == "/q":
                 break
+
+            # Voice output toggle: speak every reply, or mute again
+            if line.strip() == SPEAK_COMMAND:
+                if speak_replies:
+                    speak_replies = False
+                    print("Voice output off.\n")
+                else:
+                    speak_replies = enable_voice_output()
+                    print()
+                continue
 
             # Voice prompt: replace the typed command with its transcription
             if line.strip() == VOICE_COMMAND:
@@ -561,6 +793,20 @@ def main() -> None:
                 messages = [messages[0]] + messages[-(HISTORY_LIMIT - 1) :]
 
             print(f"Assistant: {reply}\n")
+
+            # Read the reply out loud when voice output is on; a TTS problem is
+            # reported and mutes the voice, but never breaks the dialog.
+            if speak_replies:
+                try:
+                    speak(reply)
+                except ImportError as e:
+                    print(f"Error: {TTS_HINT} (missing: {e.name})")
+                    speak_replies = False
+                except KeyboardInterrupt:
+                    break
+                except (OSError, RuntimeError, ValueError) as e:
+                    print(f"Error: voice output failed ({e})")
+                    speak_replies = False
     finally:
         save_input_history()
         print("Bye!")

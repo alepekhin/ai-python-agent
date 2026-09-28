@@ -3,19 +3,21 @@
 ## Goal 
 
 Use LLM conversation history in next prompt, typed or dictated 
+Print and say response 
 
 ## Requirements 
 
-- Use Python3, Ollama, model carstenuhlig/omnicoder-2-9b:latest  
+- Use Python3, Ollama, model ollama/gemma4:latest, reached over `/v1/chat/completions` (the only endpoint that takes an audio prompt)  
 - CLI 
 - End dialog with empty prompt (also `/q` or Ctrl+C) 
 - History length should be less than context length (trimmed to `HISTORY_LIMIT` = 32 messages) 
 - Show "Thinking..." while the model responds 
-- Voice input with faster-whisper on `/v` (Enter stops recording)
+- Voice input on `/v` (Enter stops recording): the recording is sent to the model as a WAV and transcribed by the model itself
+- Voice output with local Piper TTS, toggled by `/s` (text is always printed too), voice picked per reply: Russian for Cyrillic replies, English otherwise
 - Works locally without internet
 - Works on computer with 16 Gb memory
 
 ## Prerequisite 
 
 - Python3, Ollama and model are installed
-- Optional for voice: `faster-whisper` and `sounddevice` installed
+- Optional for voice: `sounddevice`, `piper-tts` installed

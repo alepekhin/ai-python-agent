@@ -52,8 +52,10 @@ class ChatSession(ABC):
 class OllamaChatSession(ChatSession):
     """Ollama chat implementation using Ollama API."""
 
-    Model: str = 'carstenuhlig/omnicoder-2-9b:latest'
-    Url: str = 'http://localhost:11434/api/chat'
+    Model: str = 'gemma4:latest'
+    # The OpenAI-compatible endpoint, not /api/chat: it is the only one that
+    # accepts an audio prompt, which the model transcribes on its own.
+    Url: str = 'http://localhost:11434/v1/chat/completions'
     SessionId: str = uuid.uuid4().hex
 
     def chat(self, history, response) -> str:
@@ -71,10 +73,10 @@ class OllamaChatSession(ChatSession):
             method='POST',
         )
 
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             data = json.loads(resp.read().decode('utf-8'))
 
-        return data['message']['content']
+        return data['choices'][0]['message']['content']
 
     def _serialize_messages(self, history) -> List[dict]:
         """Convert history objects to dict format."""

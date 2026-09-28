@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import contextlib
 import http.server
 import json
@@ -34,16 +35,35 @@ FAKE_DDG_HTML = """\
 
 class FakeOllamaHandler(http.server.BaseHTTPRequestHandler):
     responses: typing.ClassVar[list[str]] = ["REPLY"]
-    requests: typing.ClassVar[list[list[dict[str, str]]]] = []
+    payloads: typing.ClassVar[list[dict[str, typing.Any]]] = []
+    # When set, a request carrying an audio block is rejected with this reason.
+    audio_error: typing.ClassVar[str | None] = None
 
     def do_POST(self) -> None:
         content_length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(content_length)
-        FakeOllamaHandler.requests.append(json.loads(raw.decode("utf-8"))["messages"])
-        body = json.dumps({"message": {"content": self.responses[0]}}).encode("utf-8")
+        payload = json.loads(raw.decode("utf-8"))
+        FakeOllamaHandler.payloads.append(payload)
+        if self.audio_error and self._has_audio(payload):
+            self._send(500, json.dumps({"error": self.audio_error}).encode("utf-8"))
+            return
+        body = json.dumps(
+            {"choices": [{"message": {"content": self.responses[0]}}]}
+        ).encode("utf-8")
         if len(self.responses) > 1:
             self.responses.pop(0)
-        self.send_response(200)
+        self._send(200, body)
+
+    @staticmethod
+    def _has_audio(payload: dict[str, typing.Any]) -> bool:
+        return any(
+            isinstance(message["content"], list)
+            and any(part["type"] == "input_audio" for part in message["content"])
+            for message in payload["messages"]
+        )
+
+    def _send(self, code: int, body: bytes) -> None:
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -75,28 +95,39 @@ class BrokenModule(types.ModuleType):
         raise ImportError(f"No module named {self.__name__!r}")
 
 
-class FakeWhisperSegment:
-    def __init__(self, text: str) -> None:
-        self.text = text
+class FakePiperChunk:
+    def __init__(self, sample_rate: int = 22050) -> None:
+        import numpy as np
+
+        self.sample_rate = sample_rate
+        self.audio_float_array = np.zeros(1600, dtype="float32")
 
 
 @contextlib.contextmanager
 def fake_voice_modules(
-    text: str, broken: tuple[str, ...] = (), mic_error: bool = False
+    broken: tuple[str, ...] = (),
+    mic_error: bool = False,
+    tts_error: bool = False,
 ) -> typing.Iterator[dict[str, typing.Any]]:
-    """Install fake sounddevice/faster_whisper modules for the duration.
+    """Install fake sounddevice/piper modules for the duration.
 
     Args:
-        text: transcription the fake Whisper model should return.
         broken: module names to fake as not installed.
         mic_error: make opening the microphone fail.
+        tts_error: make the fake Piper voice fail to load.
 
     Yields:
-        A dict recording the fake model name and the transcribed audio.
+        A dict recording the voice files requested/downloaded, the text
+        handed to the synthesizer and the chunks played.
     """
     import numpy as np
 
-    calls: dict[str, typing.Any] = {"model": None, "transcribed": []}
+    calls: dict[str, typing.Any] = {
+        "downloaded": [],
+        "loaded": [],
+        "spoken": [],
+        "played": [],
+    }
 
     class PortAudioError(Exception):
         pass
@@ -117,32 +148,63 @@ def fake_voice_modules(
         def __exit__(self, *exc: object) -> bool:
             return False
 
-    class WhisperModel:
-        def __init__(self, name: str, **kwargs: typing.Any) -> None:
-            calls["model"] = name
+    def play(data: typing.Any, samplerate: typing.Any) -> None:
+        calls["played"].append((len(data), samplerate))
 
-        def transcribe(
-            self, audio: typing.Any, **kwargs: typing.Any
-        ) -> tuple[list[typing.Any], object]:
-            calls["transcribed"].append((len(audio), kwargs))
-            return [FakeWhisperSegment(text)], object()
+    def wait() -> None:
+        pass
+
+    def stop() -> None:
+        pass
+
+    class PiperVoice:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        @staticmethod
+        def load(
+            model_path: typing.Any, config_path: typing.Any = None, **kwargs: typing.Any
+        ) -> typing.Self:
+            if tts_error:
+                raise RuntimeError("broken onnx model")
+            calls["loaded"].append((str(model_path), str(config_path)))
+            return PiperVoice(Path(str(model_path)).stem)
+
+        def synthesize(self, text: str) -> list[typing.Any]:
+            calls["spoken"].append((self.name, text))
+            return [FakePiperChunk()]
+
+    def download_voice(voice: str, download_dir: typing.Any) -> None:
+        calls["downloaded"].append((voice, str(download_dir)))
+        (Path(download_dir) / f"{voice}.onnx").write_bytes(b"")
+        (Path(download_dir) / f"{voice}.onnx.json").write_text("{}")
 
     sounddevice = types.ModuleType("sounddevice")
     sounddevice.RawInputStream = RawInputStream  # type: ignore[attr-defined]
     sounddevice.PortAudioError = PortAudioError  # type: ignore[attr-defined]
-    faster_whisper = types.ModuleType("faster_whisper")
-    faster_whisper.WhisperModel = WhisperModel  # type: ignore[attr-defined]
+    sounddevice.play = play  # type: ignore[attr-defined]
+    sounddevice.wait = wait  # type: ignore[attr-defined]
+    sounddevice.stop = stop  # type: ignore[attr-defined]
+    download_voices = types.ModuleType("piper.download_voices")
+    download_voices.download_voice = download_voice  # type: ignore[attr-defined]
+    piper = types.ModuleType("piper")
+    piper.PiperVoice = PiperVoice  # type: ignore[attr-defined]
+    piper.download_voices = download_voices  # type: ignore[attr-defined]
 
-    fakes = {"sounddevice": sounddevice, "faster_whisper": faster_whisper}
+    fakes = {
+        "sounddevice": sounddevice,
+        "piper": piper,
+        "piper.download_voices": download_voices,
+    }
     saved = {name: sys.modules.get(name) for name in fakes}
     for name, fake in fakes.items():
         sys.modules[name] = BrokenModule(name) if name in broken else fake
 
-    agent.load_whisper.cache_clear()
+    agent.load_piper.cache_clear()
     try:
         yield calls
     finally:
-        agent.load_whisper.cache_clear()
+        agent.load_piper.cache_clear()
         for name, module in saved.items():
             if module is None:
                 del sys.modules[name]
@@ -166,7 +228,9 @@ class AgentTTYTest(unittest.TestCase):
         cls.port = cls.server.server_address[1]
 
         cls.ddg_server = http.server.HTTPServer(("127.0.0.1", 0), FakeDDGHandler)
-        cls.ddg_thread = threading.Thread(target=cls.ddg_server.serve_forever, daemon=True)
+        cls.ddg_thread = threading.Thread(
+            target=cls.ddg_server.serve_forever, daemon=True
+        )
         cls.ddg_thread.start()
         cls.ddg_port = cls.ddg_server.server_address[1]
 
@@ -178,11 +242,15 @@ class AgentTTYTest(unittest.TestCase):
         cls.ddg_server.server_close()
 
     def setUp(self) -> None:
-        # Point the persisted history at a throwaway file, so tests never read
-        # or write the real one in the user's home directory.
+        # Point the persisted history and the voice cache at a throwaway
+        # directory, so tests never read or write the real ones in the user's
+        # home directory.
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
         agent.HISTORY_FILE = str(Path(self.tmpdir.name) / "state" / "history")
+        agent.TTS_DIR = str(Path(self.tmpdir.name) / "state" / "voices")
+        agent.load_piper.cache_clear()
+        self.addCleanup(agent.load_piper.cache_clear)
         if agent.readline is not None:
             agent.readline.clear_history()
             self.addCleanup(agent.readline.clear_history)
@@ -214,12 +282,12 @@ class AgentTTYTest(unittest.TestCase):
         old_url: str = agent.OLLAMA_URL
         old_model: str = agent.MODEL
         old_ddg: str = agent.DDG_URL
-        agent.OLLAMA_URL = f"http://127.0.0.1:{self.port}/api/chat"
+        agent.OLLAMA_URL = f"http://127.0.0.1:{self.port}/v1/chat/completions"
         agent.DDG_URL = f"http://127.0.0.1:{self.ddg_port}/html/"
         agent.MODEL = "test-model"
         if responses is not None:
             FakeOllamaHandler.responses = list(responses)
-        FakeOllamaHandler.requests = []
+        FakeOllamaHandler.payloads = []
         sys.stdout.reconfigure(line_buffering=True)
 
         output: bytes = b""
@@ -311,7 +379,20 @@ class AgentTTYTest(unittest.TestCase):
 
     def _last_user_prompts(self) -> list[str]:
         return [
-            m["content"] for m in FakeOllamaHandler.requests[-1] if m["role"] == "user"
+            m["content"]
+            for m in FakeOllamaHandler.payloads[-1]["messages"]
+            if m["role"] == "user" and isinstance(m["content"], str)
+        ]
+
+    def _audio_blocks(self) -> list[dict[str, typing.Any]]:
+        """Audio blocks of every `input_audio` part the model was sent."""
+        return [
+            part["input_audio"]
+            for payload in FakeOllamaHandler.payloads
+            for message in payload["messages"]
+            if isinstance(message["content"], list)
+            for part in message["content"]
+            if part["type"] == "input_audio"
         ]
 
     @unittest.skipIf(agent.readline is None, "readline is not available")
@@ -320,7 +401,7 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("Assistant: ONE", output)
         self.assertIn("Assistant: TWO", output)
         self.assertIn("Bye!", output)
-        self.assertEqual(len(FakeOllamaHandler.requests), 2)
+        self.assertEqual(len(FakeOllamaHandler.payloads), 2)
         self.assertEqual(self._last_user_prompts(), ["hello", "hello"])
 
     @unittest.skipIf(agent.readline is None, "readline is not available")
@@ -334,7 +415,7 @@ class AgentTTYTest(unittest.TestCase):
         )
         self.assertIn("Assistant: ONE", output)
         self.assertIn("Bye!", output)
-        self.assertEqual(len(FakeOllamaHandler.requests), 1)
+        self.assertEqual(len(FakeOllamaHandler.payloads), 1)
         self.assertNotIn("Assistant: TWO", output)
 
     @unittest.skipIf(agent.readline is None, "readline is not available")
@@ -363,43 +444,78 @@ class AgentTTYTest(unittest.TestCase):
         self.assertEqual(len(history), agent.HISTORY_LIMIT)
         self.assertEqual(history[-1], f"old prompt {agent.HISTORY_LIMIT + 4}")
 
-    def test_voice_prompt_is_transcribed_and_sent(self) -> None:
-        with fake_voice_modules("tell me a joke") as calls:
+    def test_voice_prompt_is_sent_as_audio_and_transcribed_by_the_model(
+        self,
+    ) -> None:
+        with fake_voice_modules():
             output = self._run_agent(
                 [agent.VOICE_COMMAND, "", ""],
-                responses=["REPLY"],
+                responses=["tell me a joke", "REPLY"],
                 markers=[b"You: ", b"Recording...", b"You: "],
             )
         self.assertIn("Recording... press Enter to stop", output)
+        self.assertIn("transcribing with the model", output)
         self.assertIn("You (voice): tell me a joke", output)
         self.assertIn("Assistant: REPLY", output)
         self.assertIn("Bye!", output)
-        self.assertEqual(calls["model"], agent.WHISPER_MODEL)
+        # The recording reached the model as a WAV, the transcript as text.
+        blocks = self._audio_blocks()
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["format"], "wav")
+        self.assertEqual(len(base64.b64decode(blocks[0]["data"])) % 2, 0)
         self.assertEqual(self._last_user_prompts(), ["tell me a joke"])
+
+    def test_voice_prompt_audio_is_a_mono_16khz_wav(self) -> None:
+        import io as fake_io
+        import wave as fake_wave
+
+        import numpy as np
+
+        samples = np.zeros(agent.VOICE_SAMPLE_RATE, dtype="float32")
+        with fake_wave.open(fake_io.BytesIO(agent.encode_wav(samples))) as wav:
+            self.assertEqual(wav.getnchannels(), 1)
+            self.assertEqual(wav.getsampwidth(), 2)
+            self.assertEqual(wav.getframerate(), agent.VOICE_SAMPLE_RATE)
+            self.assertEqual(wav.getnframes(), len(samples))
+
+    def test_transcription_asks_the_model_and_skips_thinking(self) -> None:
+        with fake_voice_modules():
+            self._run_agent(
+                [agent.VOICE_COMMAND, "", ""],
+                responses=["typed out loud", "REPLY"],
+                markers=[b"You: ", b"Recording...", b"You: "],
+            )
+        first = FakeOllamaHandler.payloads[0]
+        self.assertEqual(first["model"], "test-model")
+        self.assertEqual(first["reasoning_effort"], "none")
+        parts = first["messages"][0]["content"]
+        self.assertEqual(parts[0]["type"], "text")
+        self.assertEqual(parts[0]["text"], agent.TRANSCRIBE_PROMPT)
+        self.assertEqual(parts[1]["type"], "input_audio")
 
     @unittest.skipIf(agent.readline is None, "readline is not available")
     def test_voice_prompt_kept_in_input_history(self) -> None:
-        with fake_voice_modules("remember me"):
+        with fake_voice_modules():
             self._run_agent(
                 [agent.VOICE_COMMAND, "", ""],
-                responses=["REPLY"],
+                responses=["remember me", "REPLY"],
                 markers=[b"You: ", b"Recording...", b"You: "],
             )
         history = Path(agent.HISTORY_FILE).read_text(encoding="utf-8")
         self.assertIn("remember me", history)
 
     def test_voice_prompt_without_packages_reports_error(self) -> None:
-        with fake_voice_modules("", broken=("sounddevice", "faster_whisper")):
+        with fake_voice_modules(broken=("sounddevice",)):
             output = self._run_agent(
                 [agent.VOICE_COMMAND, "hello", ""], responses=["REPLY"]
             )
-        self.assertIn("pip install faster-whisper sounddevice", output)
+        self.assertIn("pip install sounddevice", output)
         self.assertIn("Assistant: REPLY", output)
         # The failed voice prompt is not sent, the dialog keeps working.
         self.assertEqual(self._last_user_prompts(), ["hello"])
 
     def test_voice_prompt_with_broken_microphone_reports_error(self) -> None:
-        with fake_voice_modules("", mic_error=True):
+        with fake_voice_modules(mic_error=True):
             output = self._run_agent(
                 [agent.VOICE_COMMAND, "hello", ""], responses=["REPLY"]
             )
@@ -407,15 +523,189 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("Assistant: REPLY", output)
         self.assertEqual(self._last_user_prompts(), ["hello"])
 
-    def test_silent_voice_prompt_is_ignored(self) -> None:
-        with fake_voice_modules(""):
+    def test_voice_prompt_with_failing_transcription_reports_error(self) -> None:
+        FakeOllamaHandler.audio_error = "audio is not supported"
+        self.addCleanup(setattr, FakeOllamaHandler, "audio_error", None)
+        with fake_voice_modules():
             output = self._run_agent(
                 [agent.VOICE_COMMAND, "", "hello", ""],
+                responses=["REPLY"],
+                markers=[b"You: ", b"Recording...", b"You: ", b"You: "],
+            )
+        self.assertIn("voice input failed (HTTP Error 500", output)
+        self.assertIn("Assistant: REPLY", output)
+        # The prompt with no transcript is never sent, the dialog keeps going.
+        self.assertEqual(self._last_user_prompts(), ["hello"])
+
+    def test_silent_voice_prompt_is_ignored(self) -> None:
+        with fake_voice_modules():
+            output = self._run_agent(
+                [agent.VOICE_COMMAND, "", "hello", ""],
+                responses=["", "REPLY"],
                 markers=[b"You: ", b"Recording...", b"You: ", b"You: "],
             )
         self.assertIn("Nothing recognized", output)
         self.assertIn("Assistant: REPLY", output)
         self.assertEqual(self._last_user_prompts(), ["hello"])
+
+    def test_reply_not_spoken_by_default(self) -> None:
+        with fake_voice_modules() as calls:
+            output = self._run_agent(["hello", ""], responses=["REPLY"])
+        self.assertIn("Assistant: REPLY", output)
+        self.assertEqual(calls["spoken"], [])
+        self.assertEqual(calls["played"], [])
+
+    def test_reply_spoken_after_speak_toggle(self) -> None:
+        with fake_voice_modules() as calls:
+            output = self._run_agent(
+                [agent.SPEAK_COMMAND, "hello", ""],
+                responses=["REPLY"],
+                markers=[b"You: ", b"You: ", b"You: "],
+            )
+        self.assertIn(agent.PIPER_VOICE_EN, output)
+        self.assertIn(agent.PIPER_VOICE_RU, output)
+        self.assertIn("Assistant: REPLY", output)
+        self.assertIn("Bye!", output)
+        self.assertEqual(calls["spoken"], [(agent.PIPER_VOICE_EN, "REPLY")])
+        self.assertEqual(len(calls["played"]), 1)
+        self.assertEqual(calls["played"][0][1], 22050)
+
+    def test_speak_toggle_mutes_again(self) -> None:
+        with fake_voice_modules() as calls:
+            output = self._run_agent(
+                [agent.SPEAK_COMMAND, agent.SPEAK_COMMAND, "hello", ""],
+                responses=["REPLY"],
+                markers=[b"You: ", b"You: ", b"You: ", b"You: "],
+            )
+        self.assertIn("Voice output off.", output)
+        self.assertEqual(calls["spoken"], [])
+
+    def test_voice_played_for_every_reply_while_on(self) -> None:
+        with fake_voice_modules() as calls:
+            self._run_agent(
+                [agent.SPEAK_COMMAND, "one", "two", ""],
+                responses=["FIRST", "SECOND"],
+                markers=[b"You: "] * 5,
+            )
+        self.assertEqual(
+            calls["spoken"],
+            [(agent.PIPER_VOICE_EN, "FIRST"), (agent.PIPER_VOICE_EN, "SECOND")],
+        )
+
+    def test_russian_reply_spoken_with_russian_voice(self) -> None:
+        with fake_voice_modules() as calls:
+            output = self._run_agent(
+                [agent.SPEAK_COMMAND, "привет", ""],
+                responses=["Привет! Как дела?"],
+                markers=[b"You: "] * 3,
+            )
+        self.assertIn("Assistant: Привет!", output)
+        self.assertEqual(calls["spoken"], [(agent.PIPER_VOICE_RU, "Привет! Как дела?")])
+
+    def test_only_the_language_actually_spoken_is_downloaded(self) -> None:
+        with fake_voice_modules() as calls:
+            self._run_agent(
+                [agent.SPEAK_COMMAND, "one", "два", ""],
+                responses=["English answer", "Русский ответ"],
+                markers=[b"You: "] * 5,
+            )
+        self.assertEqual(
+            calls["downloaded"],
+            [
+                (agent.PIPER_VOICE_EN, agent.TTS_DIR),
+                (agent.PIPER_VOICE_RU, agent.TTS_DIR),
+            ],
+        )
+
+    def test_voice_downloaded_once_and_cached(self) -> None:
+        with fake_voice_modules() as calls:
+            self._run_agent(
+                [agent.SPEAK_COMMAND, "one", "two", ""],
+                responses=["FIRST", "SECOND"],
+                markers=[b"You: "] * 5,
+            )
+            self.assertEqual(
+                calls["downloaded"], [(agent.PIPER_VOICE_EN, agent.TTS_DIR)]
+            )
+            self.assertEqual(len(calls["loaded"]), 1)
+            model_path, config_path = calls["loaded"][0]
+            self.assertTrue(model_path.endswith(f"{agent.PIPER_VOICE_EN}.onnx"))
+            self.assertTrue(config_path.endswith(f"{agent.PIPER_VOICE_EN}.onnx.json"))
+            # A second session reuses the files already on disk.
+            calls["downloaded"].clear()
+            self._run_agent(
+                [agent.SPEAK_COMMAND, "hello", ""],
+                responses=["REPLY"],
+                markers=[b"You: "] * 3,
+            )
+        self.assertEqual(calls["downloaded"], [])
+        self.assertEqual(
+            calls["spoken"],
+            [
+                (agent.PIPER_VOICE_EN, "FIRST"),
+                (agent.PIPER_VOICE_EN, "SECOND"),
+                (agent.PIPER_VOICE_EN, "REPLY"),
+            ],
+        )
+
+    def test_detect_language(self) -> None:
+        self.assertEqual(agent.detect_language("Hello there"), "en")
+        self.assertEqual(agent.detect_language("Привет, как дела?"), "ru")
+        # The script the reply mostly uses wins, whatever the other one is.
+        self.assertEqual(agent.detect_language("Ответ про Python 3.11 и списки"), "ru")
+        self.assertEqual(agent.detect_language("Answer mentions «Привет» once"), "en")
+        self.assertEqual(agent.detect_language("1234 - 5678 = ?"), "en")
+
+    def test_speakable_text_strips_markup(self) -> None:
+        self.assertEqual(
+            agent.speakable_text(
+                "Here is `print(1)` and [docs](https://example.com/x) plus "
+                "https://example.org/y\n\n```python\nprint('nope')\n```\n**Done!**"
+            ),
+            "Here is print(1) and docs plus link Done!",
+        )
+
+    def test_speakable_text_link_word_follows_language(self) -> None:
+        self.assertEqual(
+            agent.speakable_text(
+                "Смотри https://example.com", agent.TTS_LINK_WORDS["ru"]
+            ),
+            "Смотри ссылка",
+        )
+
+    def test_speakable_text_caps_long_reply(self) -> None:
+        spoken = agent.speakable_text("word " * agent.TTS_MAX_CHARS)
+        self.assertLessEqual(len(spoken), agent.TTS_MAX_CHARS + len(", and more."))
+        self.assertTrue(spoken.endswith(", and more."))
+
+    def test_voice_output_without_packages_reports_error(self) -> None:
+        with fake_voice_modules(broken=("piper", "piper.download_voices")):
+            output = self._run_agent(
+                [agent.SPEAK_COMMAND, "hello", ""], responses=["REPLY"]
+            )
+        self.assertIn("pip install piper-tts sounddevice", output)
+        self.assertIn("Assistant: REPLY", output)
+        # Voice output stays off, the dialog keeps working.
+        self.assertNotIn("Voice output on", output)
+
+    def test_voice_output_with_broken_model_reports_error(self) -> None:
+        with fake_voice_modules(tts_error=True):
+            output = self._run_agent(
+                [agent.SPEAK_COMMAND, "hello", ""], responses=["REPLY"]
+            )
+        self.assertIn("cannot enable voice output (broken onnx model)", output)
+        self.assertIn("Assistant: REPLY", output)
+
+    def test_reply_with_nothing_speakable_is_not_played(self) -> None:
+        with fake_voice_modules() as calls:
+            output = self._run_agent(
+                [agent.SPEAK_COMMAND, "hello", ""],
+                responses=["```\nprint('hi')\n```"],
+                markers=[b"You: "] * 3,
+            )
+        self.assertIn("Assistant:", output)
+        self.assertEqual(calls["spoken"], [])
+        self.assertEqual(calls["played"], [])
 
 
 if __name__ == "__main__":

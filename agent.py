@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive CLI AI agent with conversation history and web search via Ollama."""
+"""Interactive CLI AI agent with conversation history, web search and file reads."""
 
 import base64
 import functools
@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -39,18 +40,38 @@ HISTORY_FILE: str = str(
     Path.home() / ".local" / "share" / "ai-python-agent" / "history"
 )
 DDG_URL: str = "https://html.duckduckgo.com/html/"
-SEARCH_RE: re.Pattern[str] = re.compile(r"\[SEARCH:\s*(.+?)\]")
+# A tool tag counts only on a line of its own, the way the system prompt asks
+# for it: a model that quotes the syntax in an answer is not asking for a tool.
+SEARCH_RE: re.Pattern[str] = re.compile(
+    r"^[ \t]*\[SEARCH:\s*(.+?)\][ \t]*$", re.MULTILINE
+)
 
-SYSTEM_PROMPT: str = """You are a helpful assistant with access to the internet.
+READ_RE: re.Pattern[str] = re.compile(r"^[ \t]*\[READ:\s*(.+?)\][ \t]*$", re.MULTILINE)
+# Where the model may read files: None confines it to the directory the agent
+# was started in, a list of directories widens that, an empty list opens the
+# reads up to the whole filesystem.
+READ_ROOTS: list[str] | None = None
+READ_MAX_BYTES: int = 200_000  # a bigger file is sent truncated
+MAX_TOOL_ROUNDS: int = 4  # tool results fed back per user prompt
+# Added to a tool result, since a small model tends to ask for another tool
+# instead of answering from what it just got.
+ANSWER_FROM_RESULT: str = "Answer from this result, do not write a tool tag."
+
+SYSTEM_PROMPT: str = """You are a helpful assistant with access to the internet
+and to the files of the directory the agent was started in.
 1st check your internal knowledge for general questions.
 2nd when you need real-time info: output exactly [SEARCH: query] on its own line.
-Search results will be provided in the next message as numbered title+snippet pairs.
+3rd when you need the content of a file: output exactly [READ: path] on its own line.
+Search and file results will be provided in the next message as numbered title+snippet
+pairs, or as the file contents prefixed with line numbers.
+Once a result is provided, answer from it — do not write another tag in the same turn.
+Paths are relative to the current directory; `~` is expanded.
 Extract ALL facts from all snippets — dates, numbers, names, capabilities, features.
 For service/website descriptions: summarize what they offer.
 Weather example: if snippet says 'hourly forecast with precipitation/wind/UV',
 report that info is available and describe the content.
 Never say 'I cannot find' when results are provided.
-Only search when needed — otherwise use general knowledge.
+Only search or read when needed — otherwise use general knowledge.
 Provide respones in Russian"""
 
 MAX_SEARCH_RESULTS: int = 5  # max results to show per search
@@ -230,6 +251,59 @@ def search_web(query: str) -> str:
                 output = wx + "\n\n" + output
 
     return output
+
+
+def read_file(path: str) -> str:
+    """Read a local file on behalf of the model and return its contents.
+
+    A relative path is taken from the first READ_ROOTS directory, `~` is
+    expanded, and symlinks are followed, but the result must still sit inside
+    one of the READ_ROOTS directories, so the model cannot walk out with `../`.
+    Directories, unreadable files and binaries are reported as a short
+    sentence the model can report back, and a file bigger than
+    READ_MAX_BYTES is sent truncated rather than dropped.
+
+    Args:
+        path: the file to read, as the model asked for it.
+
+    Returns:
+        The file contents prefixed with line numbers, or a message explaining
+        why it could not be read.
+    """
+    roots = [Path.cwd()] if READ_ROOTS is None else READ_ROOTS
+    allowed = [Path(root).expanduser().resolve() for root in roots]
+    base = allowed[0] if allowed else Path.cwd()
+    try:
+        target = Path(path).expanduser()
+        target = (target if target.is_absolute() else base / target).resolve()
+    except (OSError, ValueError) as e:
+        return f"Cannot read {path}: {e}"
+    if not any(target == root or root in target.parents for root in allowed):
+        return f"Cannot read {path}: outside {', '.join(str(r) for r in allowed)}"
+    if target.is_dir():
+        return f"Cannot read {path}: it is a directory"
+    try:
+        with target.open("rb") as handle:
+            data = handle.read(READ_MAX_BYTES + 1)
+    except OSError as e:
+        return f"Cannot read {path}: {e.strerror or e}"
+    if b"\0" in data:
+        return f"Cannot read {path}: it looks like a binary file"
+    truncated = len(data) > READ_MAX_BYTES
+    text = data[:READ_MAX_BYTES].decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    numbered = "\n".join(f"{i}: {line}" for i, line in enumerate(lines, 1))
+    note = "\n... truncated, file is bigger than READ_MAX_BYTES" if truncated else ""
+    return f"Contents of {path} ({len(lines)} lines):\n{numbered}{note}"
+
+
+# Tools the model can ask for by writing a tag into its reply: the tag name, the
+# pattern that recognizes it, and the function that carries it out. Both return
+# text that is fed back to the model as the next message.
+TOOLS: dict[str, tuple[re.Pattern[str], Callable[[str], str]]] = {
+    "SEARCH": (SEARCH_RE, search_web),
+    "READ": (READ_RE, read_file),
+}
 
 
 def chat(messages: list[dict[str, str]], session_id: str) -> str:
@@ -685,6 +759,77 @@ def enable_voice_output() -> bool:
     return True
 
 
+def ask_model(messages: list[dict[str, str]], session_id: str) -> str | None:
+    """Send the history to the model and report the usual failures.
+
+    Args:
+        messages: the conversation history, sent as is.
+        session_id: unique session identifier for the conversation.
+
+    Returns:
+        The model's reply, or None if the model could not be reached or
+        answered something unexpected (the reason is printed).
+    """
+    try:
+        return chat(messages, session_id)
+    except urllib.error.URLError as e:
+        print(f"Error: cannot reach Ollama ({e.reason})")
+    except (KeyError, json.JSONDecodeError) as e:
+        print(f"Error: unexpected response from Ollama ({e})")
+    return None
+
+
+def agent_turn(messages: list[dict[str, str]], session_id: str) -> str | None:
+    """Answer the last user message, running the tools the model asks for.
+
+    A reply carrying a tool tag such as [SEARCH: query] or [READ: path] is not
+    shown as the answer: the tool runs, its result is appended to the history
+    and the model is asked again, up to MAX_TOOL_ROUNDS times. The reply that
+    carries no tag is the answer, and the history is trimmed afterwards.
+
+    Args:
+        messages: the conversation history, extended in place.
+        session_id: unique session identifier for the conversation.
+
+    Returns:
+        The answer to show to the user, or None if a request failed (the
+        reason is printed and the dialog ends).
+    """
+    reply = ask_model(messages, session_id)
+    if reply is None:
+        return None
+    messages.append({"role": "assistant", "content": reply})
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        call = next(
+            (
+                (name, tool, match.group(1))
+                for name, (pattern, tool) in TOOLS.items()
+                if (match := pattern.search(reply))
+            ),
+            None,
+        )
+        if call is None:
+            break
+        name, tool, argument = call
+        print(f"[{name.lower()}] {argument}", flush=True)
+        # The result is asked for as a plain message, with a reminder to answer
+        # from it: a small model tends to write another tag instead.
+        messages.append(
+            {"role": "user", "content": f"{tool(argument)}\n\n{ANSWER_FROM_RESULT}"}
+        )
+        reply = ask_model(messages, session_id)
+        if reply is None:
+            return None
+        messages.append({"role": "assistant", "content": reply})
+
+    # Enforce history limit by dropping oldest messages after index 1
+    if len(messages) > HISTORY_LIMIT:
+        del messages[1 : len(messages) - (HISTORY_LIMIT - 1)]
+
+    return reply
+
+
 def main() -> None:
     """Main entry point for the interactive CLI agent.
 
@@ -751,47 +896,13 @@ def main() -> None:
 
             print("Thinking...", flush=True)
 
-            # Get response from Ollama model with full history context
-            try:
-                reply = chat(messages, session_id)
-            except urllib.error.URLError as e:
-                print(f"Error: cannot reach Ollama ({e.reason})")
+            # Answer, running whatever tools the model asks for on the way
+            reply = agent_turn(messages, session_id)
+            if reply is None:
                 break
-            except (KeyError, json.JSONDecodeError) as e:
-                print(f"Error: unexpected response from Ollama ({e})")
-                break
-
-            # Assistant's reply
-            messages.append({"role": "assistant", "content": reply})
-
-            # Check if the reply contains a [SEARCH: query] pattern
-            match = SEARCH_RE.search(reply)
-            if match:
-                query = match.group(1)
-                print(f"[search] {query}", flush=True)
-                search_results = search_web(query)
-                # Append both the original reply (with search trigger) and
-                # the search results to history, then regenerate response
-                messages.append({"role": "assistant", "content": reply})
-                messages.append({"role": "user", "content": search_results})
-                try:
-                    reply = chat(messages, session_id)
-                except urllib.error.URLError as e:
-                    print(f"Error: cannot reach Ollama ({e.reason})")
-                    break
-                except (KeyError, json.JSONDecodeError) as e:
-                    print(f"Error: unexpected response from Ollama ({e})")
-                    break
-
-            # Add final assistant reply to history and trim to HISTORY_LIMIT
-            messages.append({"role": "assistant", "content": reply})
 
             # Debug: print full message history (uncomment to inspect)
             # print(messages)
-
-            # Enforce history limit by dropping oldest messages after index 1
-            if len(messages) > HISTORY_LIMIT:
-                messages = [messages[0]] + messages[-(HISTORY_LIMIT - 1) :]
 
             print(f"Assistant: {reply}\n")
 

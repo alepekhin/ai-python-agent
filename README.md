@@ -1,6 +1,6 @@
 # ai-python-agent
 
-A simple CLI AI agent with conversation history, built on Python and Ollama. It keeps the whole chat history in context so the model can answer follow-up questions, while trimming the history to stay within the context length. Prompts can be typed or dictated, and the replies can be read out loud by a local neural voice.
+A simple CLI AI agent with conversation history, built on Python and Ollama. It keeps the whole chat history in context so the model can answer follow-up questions, while trimming the history to stay within the context length. The model can search the web and read local files, prompts can be typed or dictated, and the replies can be read out loud by a local neural voice.
 
 ## Requirements
 
@@ -44,6 +44,30 @@ Assistant: Hello! How can I help you?
 You:
 Bye!
 ```
+
+## Tools
+
+The model can use two tools by writing a tag into its reply. The agent runs the tool, feeds its result back to the model as the next message and asks again, so the tag never reaches you — you only see the final answer. A reply is a tool call at most `MAX_TOOL_ROUNDS` (4) times per prompt, so a model that keeps asking for the same file cannot loop forever.
+
+| Tag | What it does | What the model gets back |
+| --- | --- | --- |
+| `[SEARCH: query]` | searches DuckDuckGo, and adds the current weather when the query mentions it | up to 5 results as numbered title + snippet pairs |
+| `[READ: path]` | reads a local file | the contents prefixed with line numbers, so it can cite them |
+
+Ask in plain language — "what is in README.md?", "compare agent.py and test_agent.py" — and the model decides whether it needs a tool. You can see what it did while it thinks: the agent prints `[read] agent.py` or `[search] ...` for every call.
+
+A tag counts only when it is alone on its line, which is how the system prompt asks for it: an answer that merely mentions the syntax (a summary of this very file, for instance) does not run anything.
+
+Reads are confined to `READ_ROOTS`, which defaults to the directory the agent was started in: a relative path is taken from there, `~` is expanded, symlinks are followed, and the resolved path must still be inside one of the roots, so `../` cannot reach the rest of the filesystem. A missing file, a directory, an unreadable file or a binary one is reported back to the model as a short sentence, and a file bigger than `READ_MAX_BYTES` is sent truncated with a note, so a huge file cannot blow up the context.
+
+Constants at the top of `agent.py`:
+
+| Constant | Default | Meaning |
+| --- | --- | --- |
+| `READ_ROOTS` | `None` (the working directory) | directories the model may read; a list of paths widens it, `[]` opens it to the whole filesystem |
+| `READ_MAX_BYTES` | `200000` | how much of a bigger file is sent before it is cut off |
+| `MAX_TOOL_ROUNDS` | `4` | how many tool results are fed back for one prompt |
+| `ANSWER_FROM_RESULT` | `Answer from this result, do not write a tool tag.` | reminder appended to a tool result, since a small model tends to ask for another tool instead of answering |
 
 ## Voice input
 
@@ -94,6 +118,7 @@ Without `piper-tts` and `sounddevice` installed the agent works as before; `/s` 
 - The model URL and name are configurable via the `OLLAMA_URL` and `MODEL` constants at the top of `agent.py`.
 - Prompts are persisted to `HISTORY_FILE` (`~/.local/share/ai-python-agent/history`): loaded on start, saved on exit, capped at `HISTORY_LIMIT` entries.
 - Voice prompts are recorded with `sounddevice` (16 kHz mono, Enter stops the recording) and the WAV is sent to the model, which returns the transcript; that transcript is just another text user message in the same history.
+- A reply carrying a `[SEARCH: ...]` or `[READ: ...]` tag is answered by running that tool (`agent_turn()`), appending its result to the history and asking the model again; the reply without a tag is the one that is printed and spoken.
 - Replies are spoken with a cached Piper voice, chosen per reply from the language detected in its text, and played through the default output device with `sounddevice`; only the speakable part of the reply is rendered.
 
 ## Tests

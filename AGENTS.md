@@ -12,6 +12,7 @@ Print and say response
 - End dialog with empty prompt (also `/q` or Ctrl+C) 
 - History length should be less than context length (trimmed to `HISTORY_LIMIT` = 32 messages) 
 - Show "Thinking..." while the model responds 
+- Tools the model can ask for by writing a tag in its reply: `[SEARCH: query]` (web search) and `[READ: path]` (local file), limited to `READ_ROOTS` (the working directory by default)
 - Voice input on `/v` (Enter stops recording): the recording is sent to the model as a WAV and transcribed by the model itself
 - Voice output with local Piper TTS, toggled by `/s` (text is always printed too), voice picked per reply: Russian for Cyrillic replies, English otherwise
 - Works locally without internet

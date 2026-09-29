@@ -249,6 +249,9 @@ class AgentTTYTest(unittest.TestCase):
         self.addCleanup(self.tmpdir.cleanup)
         agent.HISTORY_FILE = str(Path(self.tmpdir.name) / "state" / "history")
         agent.TTS_DIR = str(Path(self.tmpdir.name) / "state" / "voices")
+        # Read the files the test creates, not the ones in the real project.
+        agent.READ_ROOTS = [self.tmpdir.name]
+        self.addCleanup(setattr, agent, "READ_ROOTS", None)
         agent.load_piper.cache_clear()
         self.addCleanup(agent.load_piper.cache_clear)
         if agent.readline is not None:
@@ -376,6 +379,74 @@ class AgentTTYTest(unittest.TestCase):
         )
         self.assertIn("[search] topic x", output)
         self.assertIn("Assistant: Here is what I found.", output)
+
+    def test_read_triggered(self) -> None:
+        (Path(self.tmpdir.name) / "notes.txt").write_text("hello\nworld\n", "utf-8")
+        output = self._run_agent(
+            ["what is in notes.txt?\n", "\n"],
+            responses=["[READ: notes.txt]", "It says hello and world."],
+        )
+        self.assertIn("[read] notes.txt", output)
+        self.assertIn("Assistant: It says hello and world.", output)
+        # The file itself reached the model, as numbered lines.
+        self.assertEqual(
+            self._last_user_prompts(),
+            [
+                "what is in notes.txt?",
+                "Contents of notes.txt (2 lines):\n1: hello\n2: world\n\n"
+                + agent.ANSWER_FROM_RESULT,
+            ],
+        )
+
+    def test_tag_quoted_in_an_answer_is_not_a_tool_call(self) -> None:
+        # A model describing the syntax is not asking for a tool.
+        output = self._run_agent(
+            ["how do you read files?\n", "\n"],
+            responses=["You write [READ: path] on its own line."],
+        )
+        self.assertIn("Assistant: You write [READ: path] on its own line.", output)
+        self.assertEqual(len(FakeOllamaHandler.payloads), 1)
+
+    def test_read_of_missing_file_is_reported_to_the_model(self) -> None:
+        output = self._run_agent(
+            ["read notes.txt\n", "\n"],
+            responses=["[READ: notes.txt]", "There is no such file."],
+        )
+        self.assertIn("[read] notes.txt", output)
+        self.assertIn("Cannot read notes.txt", self._last_user_prompts()[-1])
+        self.assertIn("Assistant: There is no such file.", output)
+
+    def test_read_stays_inside_the_allowed_directories(self) -> None:
+        secret = Path(self.tmpdir.name).parent / "secret.txt"
+        secret.write_text("top secret\n", encoding="utf-8")
+        self.addCleanup(secret.unlink)
+        output = self._run_agent(
+            ["read the secret\n", "\n"],
+            responses=[f"[READ: {secret}]", "I cannot read that file."],
+        )
+        self.assertIn("outside", self._last_user_prompts()[-1])
+        self.assertNotIn("top secret", output)
+
+    def test_search_and_read_can_follow_each_other(self) -> None:
+        (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", encoding="utf-8")
+        output = self._run_agent(
+            ["check a.txt\n", "\n"],
+            responses=["[READ: a.txt]", "[SEARCH: a.txt meaning]", "Alpha."],
+        )
+        self.assertIn("[read] a.txt", output)
+        self.assertIn("[search] a.txt meaning", output)
+        self.assertIn("Assistant: Alpha.", output)
+
+    def test_tool_is_not_run_forever(self) -> None:
+        (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", encoding="utf-8")
+        output = self._run_agent(
+            ["check a.txt\n", "\n"],
+            responses=["[READ: a.txt]"] * (agent.MAX_TOOL_ROUNDS + 1),
+        )
+        # One reply to start with, plus one per round the agent is willing to run.
+        self.assertEqual(len(FakeOllamaHandler.payloads), agent.MAX_TOOL_ROUNDS + 1)
+        self.assertIn("[read] a.txt", output)
+        self.assertIn("Bye!", output)
 
     def _last_user_prompts(self) -> list[str]:
         return [

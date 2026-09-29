@@ -6,6 +6,7 @@ import functools
 import html
 import io
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -13,6 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import wave
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,11 @@ try:  # termios/tty are POSIX-only and needed to read a bare Enter keypress
 except ImportError:
     termios = None  # type: ignore[assignment]
     tty = None  # type: ignore[assignment]
+
+try:  # select is POSIX-only, used to watch for a keypress without blocking
+    import select
+except ImportError:
+    select = None  # type: ignore[assignment]
 
 # Configuration: model, API endpoint, history limit, search service
 MODEL: str = "gemma4:latest"
@@ -129,10 +136,38 @@ WEATHER_RE: re.Pattern[str] = re.compile(
 VOICE_COMMAND: str = "/v"  # type the prompt instead of typing it
 VOICE_SAMPLE_RATE: int = 16000  # sample rate of the WAV sent to the model
 VOICE_BLOCK_MS: int = 100  # microphone read block size
+# A pause this long ends the prompt on its own, so it can be dictated
+# without touching the keyboard.
+VOICE_SILENCE_MS: int = 2000
+# What counts as a pause is decided against the room, not against a fixed
+# level: the quietest of the last VOICE_NOISE_BLOCKS blocks is the noise
+# the microphone hears, and only what is VOICE_NOISE_FACTOR times louder
+# than that is speech. A fan, a hiss or a hot mic gain therefore cannot
+# drown out the pause, and a quiet microphone is not deafened by the
+# threshold either. VOICE_SPEECH_RMS is the last resort for a dead-silent
+# input, where there is no noise to compare against.
+VOICE_NOISE_BLOCKS: int = 10
+VOICE_NOISE_FACTOR: float = 2.5
+VOICE_SPEECH_RMS: float = 0.003
+# The bar is raised at once when the room gets louder, but lowered only
+# slowly, so one unvoiced syllable does not make the noise look like speech.
+VOICE_NOISE_FALL: float = 0.1
+VOICE_POLL_S: float = 0.1  # how often Enter and the pause are looked at
 VOICE_HINT: str = "Voice input needs sounddevice: pip install sounddevice"
+# A recording is turned up to this peak before it is sent, because speech
+# spoken quietly from across the desk reaches the model's audio tower as a
+# whisper it can only guess at, and a guess is what comes back as the
+# transcript. The gain is capped, or a recording of nothing but room noise
+# would be blown up into noise worth transcribing.
+VOICE_PEAK: float = 0.95
+VOICE_MAX_GAIN: float = 100.0
 # The model transcribes the recording itself, so it is only asked to write
-# down what it hears, and thinking is off so the reply is short and quick.
-TRANSCRIBE_PROMPT: str = "Transcribe the audio. Output the transcription only."
+# down what it hears, in the language it hears it in, and thinking is off so
+# the reply is short and quick.
+TRANSCRIBE_PROMPT: str = (
+    "Transcribe the audio verbatim, in the language it is spoken in."
+    " Output the transcription only."
+)
 
 SPEAK_COMMAND: str = "/s"  # toggle spoken replies
 # One Piper voice per language, picked automatically from the reply's script.
@@ -699,38 +734,143 @@ def remember_prompt(line: str) -> None:
         readline.add_history(line)
 
 
-def wait_for_enter() -> None:
-    """Block until Enter is pressed, with terminal echo turned off.
+class PauseWatcher:
+    """Notice the pause that ends a dictated prompt.
+
+    Whether a block is speech is decided against the room instead of against
+    a fixed level: the quietest of the last VOICE_NOISE_BLOCKS blocks is the
+    noise the microphone hears, and a block has to be VOICE_NOISE_FACTOR
+    times louder than that to count as speech. Room noise — a fan, a hiss, a
+    microphone gain turned up — therefore stays silence, and a quiet
+    microphone is not made deaf by the threshold. A loud block restarts the
+    clock; while nothing but quieter blocks arrive the pause keeps growing,
+    and once it reaches VOICE_SILENCE_MS the recording is over, so the
+    prompt can be dictated without pressing Enter. The clock itself only
+    starts at the first word, and silence before it ends nothing, or a
+    quiet room would stop the recording before anything was said. The first
+    VOICE_NOISE_BLOCKS blocks only go to measuring the room, since a word
+    cannot be told from the room before the room is known.
+    """
+
+    def __init__(self) -> None:
+        self.levels: deque[float] = deque(maxlen=VOICE_NOISE_BLOCKS)
+        self.blocks: int = 0  # blocks seen
+        self.spoken: bool = False  # a word was heard, so the pause means one
+        self.voice_blocks: int = 0  # blocks up to and including the last word
+        self.silent_ms: int = 0  # how long the pause has been going on
+        self.threshold: float = VOICE_SPEECH_RMS  # level that counts as speech
+
+    @property
+    def noise(self) -> float:
+        """What the room itself sounds like, as the recent blocks see it.
+
+        The quietest of the last VOICE_NOISE_BLOCKS blocks, with the very
+        quietest fifth ignored: a block that dropped to nothing would
+        otherwise pass for a silent room and let the noise look like speech.
+        """
+        levels = sorted(self.levels)
+        return levels[len(levels) // 5] if levels else 0.0
+
+    def _follow(self) -> None:
+        """Move the speech bar towards what the room turns out to be."""
+        wanted = max(VOICE_SPEECH_RMS, self.noise * VOICE_NOISE_FACTOR)
+        if wanted > self.threshold:
+            self.threshold = wanted  # louder room: raise the bar at once
+        else:
+            self.threshold += (wanted - self.threshold) * VOICE_NOISE_FALL
+
+    def add(self, level: float, samples: int) -> None:
+        """Account one recorded block of `samples` values at RMS `level`.
+
+        Args:
+            level: RMS level of the block, 0.0 to 1.0.
+            samples: number of samples in the block.
+
+        Returns:
+            None
+        """
+        self.blocks += 1
+        self.levels.append(level)
+        # The level is weighed against the bar the previous blocks left
+        # behind, so a block cannot pass itself off as the noise it is, and
+        # the opening blocks only measure the room: a microphone that comes
+        # up with a bang in its first block would otherwise pass for a word
+        # and set the level the whole recording is judged against too high
+        # to ever hear another one.
+        loud = self.blocks > VOICE_NOISE_BLOCKS and level > self.threshold
+        if loud:
+            self.spoken = True
+            self.voice_blocks = self.blocks
+            self.silent_ms = 0
+        elif self.spoken:
+            # The clock only runs once a word has been heard: the silence
+            # before the first word belongs to no pause, so it is not counted.
+            self.silent_ms += samples * 1000 // VOICE_SAMPLE_RATE
+        self._follow()
+
+    @property
+    def paused(self) -> bool:
+        """True once the speaker has paused long enough to end the prompt."""
+        return self.spoken and self.silent_ms >= VOICE_SILENCE_MS
+
+
+def wait_for_stop(is_done: Callable[[], bool]) -> bool:
+    """Block until Enter is pressed or `is_done` turns true.
 
     The terminal is switched to cbreak mode, so a single keypress is
     delivered without waiting for a newline while Ctrl+C keeps working.
-    When terminal control is unavailable the call falls back to reading a
-    whole line.
+    Stdin is polled instead of read in one blocking go, so the pause of a
+    voice prompt can end the wait on its own. Every keypress that comes in
+    while the wait is on belongs to the recording: a prompt typed ahead of
+    it is swallowed rather than answered after the recording. When terminal
+    control is unavailable the call falls back to reading a whole line, and
+    only Enter stops the wait.
+
+    Args:
+        is_done: called between keypresses; when it turns true the wait
+                 ends even if nothing was typed.
 
     Returns:
-        None
+        True if Enter (or the end of input) stopped the wait, False if
+        `is_done` did.
     """
-    if termios is None or tty is None:
+    if termios is None or tty is None or select is None:
         sys.stdin.readline()
-        return
+        return True
     fd = sys.stdin.fileno()
     try:
         saved = termios.tcgetattr(fd)
-    except termios.error:  # not a terminal (e.g. piped input)
+    except (termios.error, OSError, ValueError):  # not a terminal (piped input)
         sys.stdin.readline()
-        return
+        return True
     try:
         tty.setcbreak(fd)
         while True:
-            char = sys.stdin.buffer.read(1)
-            if char in (b"", b"\r", b"\n"):  # Enter, or end of input
-                break
+            if is_done():
+                # A keypress that raced with the pause belongs to the
+                # recording, not to the prompt that comes after it.
+                while select.select([fd], [], [], 0)[0]:
+                    if os.read(fd, 1) in (b"", b"\r", b"\n"):
+                        break
+                return False
+            if select.select([fd], [], [], VOICE_POLL_S)[0]:
+                # Straight from the terminal, never through sys.stdin: the
+                # buffered reader takes every byte that is waiting at once,
+                # and select then reports nothing while the rest of what was
+                # typed sits unread in the buffer, so the wait would never end.
+                char = os.read(fd, 1)
+                if char in (b"", b"\r", b"\n"):  # Enter, or end of input
+                    return True
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
 def record_voice() -> Any:
-    """Record mono 16 kHz audio from the default microphone until Enter.
+    """Record mono 16 kHz audio from the default microphone.
+
+    Recording ends on Enter or on a pause of VOICE_SILENCE_MS, whichever
+    comes first, and the silence of the closing pause is left out of the
+    samples. A recording without a word in it is not returned at all.
 
     Returns:
         A numpy float32 array with the recorded samples, empty if nothing
@@ -744,11 +884,14 @@ def record_voice() -> Any:
     import sounddevice as sd
 
     blocks: list[Any] = []
+    watcher = PauseWatcher()
 
     def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
         # A raw stream hands out a buffer over memory that PortAudio reuses
         # for the next block, so the samples have to be copied out.
-        blocks.append(np.frombuffer(indata, dtype="float32").copy())
+        block = np.frombuffer(indata, dtype="float32").copy()
+        blocks.append(block)
+        watcher.add(float(np.sqrt(np.mean(block * block))), len(block))
 
     block_size = int(VOICE_SAMPLE_RATE * VOICE_BLOCK_MS / 1000)
     try:
@@ -759,14 +902,32 @@ def record_voice() -> Any:
             channels=1,
             callback=callback,
         ):
-            print("Recording... press Enter to stop, Ctrl+C to cancel", flush=True)
-            wait_for_enter()
+            print(
+                "Recording... press Enter to stop, a"
+                f" {VOICE_SILENCE_MS // 1000}s pause ends it, Ctrl+C to cancel",
+                flush=True,
+            )
+            by_enter = wait_for_stop(lambda: watcher.paused)
     except sd.PortAudioError as e:
         raise OSError(f"cannot open microphone: {e}") from e
 
     if not blocks:
         return np.empty(0, dtype="float32")
-    return np.concatenate(blocks)
+    if not by_enter:
+        print("Heard a pause, ending the prompt.", flush=True)
+    if not watcher.spoken:
+        # Nothing was said, so the pause could never have been noticed. The
+        # room is not sent to the model either: it would only come back as a
+        # word guessed out of the noise. The levels involved are printed
+        # instead, to make a threshold easy to tune.
+        print(
+            f"Nothing said over the noise: {watcher.noise:.4f} is the noise,"
+            f" {watcher.threshold:.4f} is what counts as speech.",
+            flush=True,
+        )
+        return np.empty(0, dtype="float32")
+    # Whatever came after the last word is silence, so it is not sent.
+    return np.concatenate(blocks[: watcher.voice_blocks])
 
 
 def encode_wav(audio: Any) -> bytes:
@@ -774,7 +935,8 @@ def encode_wav(audio: Any) -> bytes:
 
     The microphone hands out float samples, while the model wants a WAV
     container, so the samples are scaled to signed 16-bit PCM and written
-    into a 44-byte header.
+    into a 44-byte header. A quiet recording is first turned up to
+    VOICE_PEAK, since the model transcribes a whisper badly.
 
     Args:
         audio: mono float32 samples at VOICE_SAMPLE_RATE, as returned by
@@ -788,13 +950,16 @@ def encode_wav(audio: Any) -> bytes:
     """
     import numpy as np
 
-    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
+    pcm = np.clip(audio, -1.0, 1.0)
+    peak = float(np.max(np.abs(pcm))) if pcm.size else 0.0
+    if 0.0 < peak < VOICE_PEAK:
+        pcm = np.clip(pcm * min(VOICE_PEAK / peak, VOICE_MAX_GAIN), -1.0, 1.0)
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav:
         wav.setnchannels(1)
         wav.setsampwidth(2)
         wav.setframerate(VOICE_SAMPLE_RATE)
-        wav.writeframes(pcm.tobytes())
+        wav.writeframes((pcm * 32767).astype("<i2").tobytes())
     return buffer.getvalue()
 
 

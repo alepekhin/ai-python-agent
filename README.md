@@ -86,9 +86,11 @@ Constants at the top of `agent.py`:
 
 ## Voice input
 
-Type `/v` instead of a prompt to dictate it: recording starts immediately, you press Enter again to stop, and the transcript is sent to the model as your prompt (echoed as `You (voice): ...`, and kept in the input history so Up recalls it). Ctrl+C cancels the recording. A transcript that comes back empty is ignored, so the dialog just shows the prompt again.
+Type `/v` instead of a prompt to dictate it: recording starts immediately and ends on a pause of 2 seconds, so you just start talking and stop; Enter also stops it right away. The transcript is sent to the model as your prompt (echoed as `You (voice): ...`, and kept in the input history so Up recalls it). Ctrl+C cancels the recording. A transcript that comes back empty is ignored, so the dialog just shows the prompt again.
 
-There is no local speech recognition: the recording is packed into a mono 16-bit 16 kHz WAV and handed to the model itself, which transcribes it. The audio travels as an `input_audio` block to Ollama's OpenAI-compatible `/v1/chat/completions` endpoint — the native `/api/chat` endpoint accepts `images` but silently drops audio (see [ollama#17730](https://github.com/ollama/ollama/issues/17730)), which is why that endpoint is used for the whole conversation, not just for the audio turn. The transcription request asks for the transcript only, with thinking disabled (`reasoning_effort: "none"`) and a fixed temperature, so it stays short and fast. The transcript then becomes a plain text user message, so no audio is kept in the history.
+A block of audio counts as speech only when it is `VOICE_NOISE_FACTOR` (2.5) times louder than the room itself, where the room level is the quiet of the last `VOICE_NOISE_BLOCKS` blocks. A fan, a hiss or a microphone gain turned up therefore cannot drown out the pause, and a quiet microphone is not deafened by the threshold either; the bar jumps up at once when the room gets louder and comes down slowly, so a soft syllable does not lower it. Two seconds of such blocks in a row end the prompt — after at least one loud block, and the pause is counted only from that block on, so a quiet room never cuts a recording short and the silence before the first word is not part of it. The closing silence is dropped, so the model gets the words and not the pause. The first `VOICE_NOISE_BLOCKS` blocks only go to measuring the room, since a word cannot be told from the room before the room is known: without that a microphone that comes up with a bang in its first block passes for a word and sets the bar so high that no word after it is ever heard, leaving a recording of 0.1 s of the bang. A recording with no word in it is not sent to the model at all — the levels involved are printed instead (`0.0180 is the noise, 0.0450 is what counts as speech`), which is what to tune if a room is too loud to be heard past. Whatever is typed while the recording runs belongs to the recording, not to the prompt that comes after it.
+
+There is no local speech recognition: the recording is packed into a mono 16-bit 16 kHz WAV and handed to the model itself, which transcribes it. A quiet recording is turned up to `VOICE_PEAK` first, at most `VOICE_MAX_GAIN` times over: speech spoken softly from across the desk reaches the model's audio tower as a whisper, and what comes back then is a guess (a stray word in another language) rather than what was said. The audio travels as an `input_audio` block to Ollama's OpenAI-compatible `/v1/chat/completions` endpoint — the native `/api/chat` endpoint accepts `images` but silently drops audio (see [ollama#17730](https://github.com/ollama/ollama/issues/17730)), which is why that endpoint is used for the whole conversation, not just for the audio turn. The transcription request asks for the transcript only, with thinking disabled (`reasoning_effort: "none"`) and a fixed temperature, so it stays short and fast. The transcript then becomes a plain text user message, so no audio is kept in the history.
 
 Audio-related constants at the top of `agent.py`:
 
@@ -98,6 +100,13 @@ Audio-related constants at the top of `agent.py`:
 | `TRANSCRIBE_PROMPT` | `Transcribe the audio. Output the transcription only.` | instruction sent along with the recording |
 | `VOICE_SAMPLE_RATE` | `16000` | sample rate of the recorded WAV |
 | `VOICE_BLOCK_MS` | `100` | microphone read block size |
+| `VOICE_SILENCE_MS` | `2000` | pause that ends the prompt without Enter |
+| `VOICE_NOISE_BLOCKS` | `10` | blocks the room level is measured over (1 s) |
+| `VOICE_NOISE_FACTOR` | `2.5` | how much louder than the room a block must be to be speech |
+| `VOICE_SPEECH_RMS` | `0.003` | level that is speech even where the room is dead silent |
+| `VOICE_NOISE_FALL` | `0.1` | how fast the speech bar may drop when the room gets quieter |
+| `VOICE_PEAK` | `0.95` | level a quiet recording is turned up to before it is sent |
+| `VOICE_MAX_GAIN` | `100.0` | most a recording is amplified, so noise is not blown up |
 
 Without `sounddevice` installed the agent works for typed prompts; `/v` just prints the install hint. A microphone that cannot be opened, or a model that cannot transcribe the recording, is reported and the dialog continues.
 
@@ -133,7 +142,7 @@ Without `piper-tts` and `sounddevice` installed the agent works as before; `/s` 
 - The model URL and name are configurable via the `OLLAMA_URL` and `MODEL` constants at the top of `agent.py`.
 - Prompts are persisted to `HISTORY_FILE` (`~/.local/share/ai-python-agent/history`): loaded on start, saved on exit, capped at `HISTORY_LIMIT` entries.
 - Every request is also written to `LAST_PROMPT_FILE` (`~/.local/share/ai-python-agent/last_prompt.json`), overwritten on each turn, so the last prompt the model was given — system prompt, whole history and the last user message, as indented JSON — can be read afterwards to see why it answered the way it did. A file that cannot be written is ignored.
-- Voice prompts are recorded with `sounddevice` (16 kHz mono, Enter stops the recording) and the WAV is sent to the model, which returns the transcript; that transcript is just another text user message in the same history.
+- Voice prompts are recorded with `sounddevice` (16 kHz mono, ended by Enter or by a 2-second pause) and the WAV is sent to the model, which returns the transcript; that transcript is just another text user message in the same history.
 - A reply carrying a `[SEARCH: ...]`, `[READ: ...]` or `[IMAGE: ...]` tag is answered by running that tool (`agent_turn()`), appending its result to the history and asking the model again; the reply without a tag is the one that is printed and spoken. The `[IMAGE: ...]` result is not text but content parts — a line naming the file and the picture as an `image_url` — so a message can be a list of parts, and only the newest few images keep their bytes.
 - Replies are spoken with a cached Piper voice, chosen per reply from the language detected in its text, and played through the default output device with `sounddevice`; only the speakable part of the reply is rendered.
 

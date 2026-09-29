@@ -108,6 +108,7 @@ def fake_voice_modules(
     broken: tuple[str, ...] = (),
     mic_error: bool = False,
     tts_error: bool = False,
+    levels: list[float] | None = None,
 ) -> typing.Iterator[dict[str, typing.Any]]:
     """Install fake sounddevice/piper modules for the duration.
 
@@ -115,6 +116,8 @@ def fake_voice_modules(
         broken: module names to fake as not installed.
         mic_error: make opening the microphone fail.
         tts_error: make the fake Piper voice fail to load.
+        levels: RMS level of each block the fake microphone delivers; by
+                default a quiet room and a word in it.
 
     Yields:
         A dict recording the voice files requested/downloaded, the text
@@ -140,9 +143,18 @@ def fake_voice_modules(
             if mic_error:
                 raise PortAudioError("no default input device")
             blocksize = self.kwargs["blocksize"]
-            self.kwargs["callback"](
-                np.zeros((blocksize, 1), dtype="float32"), blocksize, None, None
+            spoken = (
+                [0.05] * agent.VOICE_NOISE_BLOCKS + [0.2, 0.2]
+                if levels is None
+                else levels
             )
+            for level in spoken:
+                self.kwargs["callback"](
+                    np.full((blocksize, 1), level, dtype="float32"),
+                    blocksize,
+                    None,
+                    None,
+                )
             return self
 
         def __exit__(self, *exc: object) -> bool:
@@ -703,6 +715,167 @@ class AgentTTYTest(unittest.TestCase):
         self.assertEqual(len(base64.b64decode(blocks[0]["data"])) % 2, 0)
         self.assertEqual(self._last_user_prompts(), ["tell me a joke"])
 
+    def test_voice_prompt_ends_on_a_pause_without_enter(self) -> None:
+        import io as fake_io
+        import wave as fake_wave
+
+        # A word after the room has been measured, then a noisy room for the
+        # length of a pause and no keypress: the pause ends the recording,
+        # and the lines after it are typed ahead of the prompt.
+        room = agent.VOICE_NOISE_BLOCKS
+        levels = [0.05] * room + [0.2] + [0.05] * (
+            agent.VOICE_SILENCE_MS // agent.VOICE_BLOCK_MS
+        )
+        with fake_voice_modules(levels=levels):
+            output = self._run_agent(
+                [agent.VOICE_COMMAND, "hello", ""],
+                responses=["dictated", "REPLY"],
+                markers=[b"You: ", b"You (voice): dictated", None, None],
+            )
+        self.assertIn("Heard a pause, ending the prompt.", output)
+        self.assertIn("You (voice): dictated", output)
+        self.assertIn("Assistant: REPLY", output)
+        self.assertIn("Bye!", output)
+        self.assertEqual(self._last_user_prompts(), ["dictated", "hello"])
+        # Only what was said reached the model: the noise of the pause did not.
+        audio = base64.b64decode(self._audio_blocks()[0]["data"])
+        with fake_wave.open(fake_io.BytesIO(audio)) as wav:
+            self.assertEqual(
+                wav.getnframes(),
+                (room + 1) * agent.VOICE_SAMPLE_RATE * agent.VOICE_BLOCK_MS // 1000,
+            )
+            pcm = wav.readframes(wav.getnframes())
+        self.assertGreater(max(pcm), 0)  # not the noise that was dropped
+
+    def test_the_opening_bang_is_not_a_word(self) -> None:
+        block = agent.VOICE_SAMPLE_RATE * agent.VOICE_BLOCK_MS // 1000
+        watcher = agent.PauseWatcher()
+        # A microphone that comes up with a bang in its very first block:
+        # the opening blocks only measure the room, or that bang would pass
+        # for a word and raise the bar above every word after it.
+        for i in range(agent.VOICE_NOISE_BLOCKS):
+            watcher.add(1.0 if i == 0 else 0.01, block)
+        self.assertFalse(watcher.spoken)
+        # The bar falls back to the room, so a word after the bang is heard.
+        for _ in range(4 * agent.VOICE_NOISE_BLOCKS):
+            watcher.add(0.01, block)
+        self.assertLess(watcher.threshold, 0.2)
+        watcher.add(0.2, block)  # a word over the quiet room
+        self.assertTrue(watcher.spoken)
+        self.assertEqual(watcher.voice_blocks, 5 * agent.VOICE_NOISE_BLOCKS + 1)
+
+    def test_nothing_spoken_is_not_sent_to_the_model(self) -> None:
+        room = agent.VOICE_NOISE_BLOCKS
+        with fake_voice_modules(levels=[0.05] * (room * 3)):
+            output = self._run_agent(
+                [agent.VOICE_COMMAND, "", "hello", ""],
+                responses=["REPLY"],
+                markers=[b"You: ", b"Recording...", b"You: ", b"You: "],
+            )
+        self.assertIn("Nothing recorded.", output)
+        self.assertIn("is what counts as speech", output)
+        # The model is asked nothing about the room: it is not a prompt.
+        self.assertEqual(self._audio_blocks(), [])
+        self.assertEqual(self._last_user_prompts(), ["hello"])
+
+    def test_typing_the_next_prompt_does_not_stall_the_recording(self) -> None:
+        # The whole next prompt, typed while the recording is still running:
+        # the Enter at its end stops the recording, and the text belongs to
+        # the recording rather than to the prompt that comes after it.
+        with fake_voice_modules():
+            output = self._run_agent(
+                [agent.VOICE_COMMAND, "Capital of France", ""],
+                responses=["Paris", "REPLY"],
+                markers=[b"You: ", b"Recording...", b"You: "],
+            )
+        self.assertIn("You (voice): Paris", output)
+        self.assertIn("Assistant: REPLY", output)
+        self.assertIn("Bye!", output)
+        self.assertEqual(self._last_user_prompts(), ["Paris"])
+
+    def test_pause_ends_the_recording_only_after_a_word(self) -> None:
+        block = agent.VOICE_SAMPLE_RATE * agent.VOICE_BLOCK_MS // 1000
+        watcher = agent.PauseWatcher()
+        # A quiet room says nothing, so it must not cut off a recording that
+        # has not started yet.
+        quiet = agent.VOICE_SILENCE_MS // agent.VOICE_BLOCK_MS + 1
+        for _ in range(quiet):
+            watcher.add(0.0, block)
+        self.assertFalse(watcher.spoken)
+        self.assertFalse(watcher.paused)
+        # A word, a short breath and the word again: the pause never grows
+        # long enough to end anything.
+        for level in [0.5, 0.0, 0.0, 0.5]:
+            watcher.add(level, block)
+        self.assertTrue(watcher.spoken)
+        self.assertFalse(watcher.paused)
+        # The pause that follows the last word ends the recording, and only
+        # the blocks up to that word are worth keeping.
+        for _ in range(agent.VOICE_SILENCE_MS // agent.VOICE_BLOCK_MS):
+            watcher.add(0.0, block)
+        self.assertTrue(watcher.paused)
+        self.assertEqual(watcher.voice_blocks, quiet + 4)
+
+    def test_silence_before_the_first_word_is_not_counted(self) -> None:
+        block = agent.VOICE_SAMPLE_RATE * agent.VOICE_BLOCK_MS // 1000
+        watcher = agent.PauseWatcher()
+        # Ten pauses worth of quiet before anybody speaks: none of it counts.
+        for _ in range(10 * (agent.VOICE_SILENCE_MS // agent.VOICE_BLOCK_MS)):
+            watcher.add(0.0, block)
+        self.assertEqual(watcher.silent_ms, 0)
+        watcher.add(0.5, block)  # the word
+        watcher.add(0.0, block)
+        self.assertEqual(watcher.silent_ms, agent.VOICE_BLOCK_MS)
+        # So the pause is counted from the word, not from the recording.
+        for _ in range(agent.VOICE_SILENCE_MS // agent.VOICE_BLOCK_MS - 1):
+            watcher.add(0.0, block)
+        self.assertTrue(watcher.paused)
+
+    def test_room_noise_does_not_hide_the_pause(self) -> None:
+        block = agent.VOICE_SAMPLE_RATE * agent.VOICE_BLOCK_MS // 1000
+        watcher = agent.PauseWatcher()
+        # A noisy room, a word over the noise, and then the same noise again:
+        # however loud the room is, the pause behind it is still a pause.
+        for _ in range(agent.VOICE_NOISE_BLOCKS):
+            watcher.add(0.05, block)
+        self.assertEqual(watcher.noise, 0.05)
+        self.assertGreater(watcher.threshold, 0.05)  # the noise stays silence
+        watcher.add(0.2, block)  # the word
+        self.assertTrue(watcher.spoken)
+        for _ in range(agent.VOICE_SILENCE_MS // agent.VOICE_BLOCK_MS - 1):
+            watcher.add(0.05, block)  # still a block short of a full pause
+            self.assertFalse(watcher.paused)
+        watcher.add(0.05, block)
+        self.assertTrue(watcher.paused)
+
+    def test_a_dropout_does_not_pass_for_a_silent_room(self) -> None:
+        block = agent.VOICE_SAMPLE_RATE * agent.VOICE_BLOCK_MS // 1000
+        watcher = agent.PauseWatcher()
+        for _ in range(agent.VOICE_NOISE_BLOCKS):
+            watcher.add(0.05, block)
+        watcher.add(0.2, block)  # the word
+        # A block that drops to nothing in the middle of the pause must not
+        # be taken for a silent room, which would turn the noise into speech.
+        for i in range(agent.VOICE_SILENCE_MS // agent.VOICE_BLOCK_MS):
+            watcher.add(0.0 if i in (5, 12) else 0.05, block)
+        self.assertTrue(watcher.paused)
+        self.assertEqual(watcher.noise, 0.05)
+        self.assertGreater(watcher.threshold, 0.05)
+
+    def test_quiet_microphone_still_hears_the_pause(self) -> None:
+        block = agent.VOICE_SAMPLE_RATE * agent.VOICE_BLOCK_MS // 1000
+        watcher = agent.PauseWatcher()
+        # The other end of the scale: a mic so quiet that speech sits at a
+        # thousandth of full scale still has to be told apart from the room.
+        for _ in range(agent.VOICE_NOISE_BLOCKS):
+            watcher.add(0.0004, block)
+        watcher.add(0.006, block)
+        self.assertTrue(watcher.spoken)
+        self.assertLess(watcher.threshold, 0.006)
+        for _ in range(agent.VOICE_SILENCE_MS // agent.VOICE_BLOCK_MS + 1):
+            watcher.add(0.0004, block)
+        self.assertTrue(watcher.paused)
+
     def test_voice_prompt_audio_is_a_mono_16khz_wav(self) -> None:
         import io as fake_io
         import wave as fake_wave
@@ -715,6 +888,30 @@ class AgentTTYTest(unittest.TestCase):
             self.assertEqual(wav.getsampwidth(), 2)
             self.assertEqual(wav.getframerate(), agent.VOICE_SAMPLE_RATE)
             self.assertEqual(wav.getnframes(), len(samples))
+
+    def test_a_quiet_recording_is_turned_up_before_it_is_sent(self) -> None:
+        import io as fake_io
+        import wave as fake_wave
+
+        import numpy as np
+
+        def peak_of(samples: object) -> float:
+            with fake_wave.open(fake_io.BytesIO(agent.encode_wav(samples))) as wav:
+                pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
+            return float(np.max(np.abs(pcm))) / 32767
+
+        # Speech spoken quietly is a whisper the model guesses at, so it is
+        # brought up to a level it can transcribe.
+        quiet = np.full(1600, 0.01, dtype="float32")
+        self.assertAlmostEqual(peak_of(quiet), agent.VOICE_PEAK, delta=0.01)
+        # A recording of nothing but the room is not amplified without bound.
+        hiss = np.full(1600, 0.0001, dtype="float32")
+        self.assertLessEqual(peak_of(hiss), agent.VOICE_MAX_GAIN * 0.0001 + 0.01)
+        # A recording that is already loud enough is left alone.
+        loud = np.full(1600, 0.99, dtype="float32")
+        self.assertAlmostEqual(peak_of(loud), 0.99, delta=0.01)
+        # Silence stays silence, rather than being turned into full-scale hiss.
+        self.assertEqual(peak_of(np.zeros(1600, dtype="float32")), 0.0)
 
     def test_transcription_asks_the_model_and_skips_thinking(self) -> None:
         with fake_voice_modules():

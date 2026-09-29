@@ -39,6 +39,11 @@ HISTORY_LIMIT: int = 32  # cap history to stay within model context
 HISTORY_FILE: str = str(
     Path.home() / ".local" / "share" / "ai-python-agent" / "history"
 )
+# The request sent to the model on every turn, so the prompt that produced the
+# last answer can be read afterwards, system prompt and history included.
+LAST_PROMPT_FILE: str = str(
+    Path.home() / ".local" / "share" / "ai-python-agent" / "last_prompt.json"
+)
 DDG_URL: str = "https://html.duckduckgo.com/html/"
 # A tool tag counts only on a line of its own, the way the system prompt asks
 # for it: a model that quotes the syntax in an answer is not asking for a tool.
@@ -47,11 +52,48 @@ SEARCH_RE: re.Pattern[str] = re.compile(
 )
 
 READ_RE: re.Pattern[str] = re.compile(r"^[ \t]*\[READ:\s*(.+?)\][ \t]*$", re.MULTILINE)
+# An image is not read as text: it is attached to the request, so the model can
+# look at it.
+IMAGE_RE: re.Pattern[str] = re.compile(
+    r"^[ \t]*\[IMAGE:\s*(.+?)\][ \t]*$", re.MULTILINE
+)
+# Image formats the model can look at, by suffix; anything else is refused
+# rather than sent as something the model would only fail to decode.
+IMAGE_MIME_TYPES: dict[str, str] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+IMAGE_MAX_BYTES: int = 5_000_000  # a bigger image is not attached
+# How many images stay in the history with their bytes: an image is hundreds of
+# kilobytes of base64 in every later request, so only the newest ones are kept
+# and the model can ask for an older one again.
+IMAGE_HISTORY_KEEP: int = 1
+# Said along with the binary files a prompt names, when one of them is an image
+# the model could look at.
+IMAGE_HINT: str = "An image among them can be attached with [IMAGE: path] to be seen."
+# Said in place of an image that was dropped from the history to keep it small.
+IMAGE_DROPPED: str = "The image is not attached any more, ask for it again if needed."
+# Stands in for the base64 of an image or a recording in the saved prompt.
+MEDIA_LOGGED: str = "base64 not saved"
 # Where the model may read files: None confines it to the directory the agent
 # was started in, a list of directories widens that, an empty list opens the
 # reads up to the whole filesystem.
 READ_ROOTS: list[str] | None = None
 READ_MAX_BYTES: int = 200_000  # a bigger file is sent truncated
+# How much of a file is looked at to tell text from binary: a binary file is
+# never read any further, the model only gets its path.
+READ_PROBE_BYTES: int = 8_192
+# A file name written in a prompt, e.g. "blood.jpg", "~/pics/a.png" or
+# "data/1.bin": the agent notes the binary ones, since their contents are not
+# sent and the model would not know what the prompt was about.
+PROMPT_PATH_RE: re.Pattern[str] = re.compile(r"[~\w./\\-]*[\w-]\.[A-Za-z0-9]{1,8}\b")
+BINARY_PATH_NOTE: str = (
+    "Files named in this prompt that are binary, given by path and size only: {paths}."
+)
 MAX_TOOL_ROUNDS: int = 4  # tool results fed back per user prompt
 # Added to a tool result, since a small model tends to ask for another tool
 # instead of answering from what it just got.
@@ -61,9 +103,10 @@ SYSTEM_PROMPT: str = """You are a helpful assistant with access to the internet
 and to the files of the directory the agent was started in.
 1st check your internal knowledge for general questions.
 2nd when you need real-time info: output exactly [SEARCH: query] on its own line.
-3rd when you need the content of a file: output exactly [READ: path] on its own line.
+3rd when you need the content of a text file: output exactly [READ: path] on its own line.
+4th when you need to see an image: output exactly [IMAGE: path] on its own line.
 Search and file results will be provided in the next message as numbered title+snippet
-pairs, or as the file contents prefixed with line numbers.
+pairs, or as the file contents prefixed with line numbers, or as the image itself.
 Once a result is provided, answer from it — do not write another tag in the same turn.
 Paths are relative to the current directory; `~` is expanded.
 Extract ALL facts from all snippets — dates, numbers, names, capabilities, features.
@@ -253,22 +296,18 @@ def search_web(query: str) -> str:
     return output
 
 
-def read_file(path: str) -> str:
-    """Read a local file on behalf of the model and return its contents.
+def resolve_read_path(path: str) -> tuple[Path | None, str]:
+    """Resolve a path the model or the user named, keeping it inside the roots.
 
     A relative path is taken from the first READ_ROOTS directory, `~` is
     expanded, and symlinks are followed, but the result must still sit inside
-    one of the READ_ROOTS directories, so the model cannot walk out with `../`.
-    Directories, unreadable files and binaries are reported as a short
-    sentence the model can report back, and a file bigger than
-    READ_MAX_BYTES is sent truncated rather than dropped.
+    one of the READ_ROOTS directories, so neither can walk out with `../`.
 
     Args:
-        path: the file to read, as the model asked for it.
+        path: the file to reach, as it was written.
 
     Returns:
-        The file contents prefixed with line numbers, or a message explaining
-        why it could not be read.
+        The resolved file, or None and the reason it is not readable.
     """
     roots = [Path.cwd()] if READ_ROOTS is None else READ_ROOTS
     allowed = [Path(root).expanduser().resolve() for root in roots]
@@ -277,18 +316,97 @@ def read_file(path: str) -> str:
         target = Path(path).expanduser()
         target = (target if target.is_absolute() else base / target).resolve()
     except (OSError, ValueError) as e:
-        return f"Cannot read {path}: {e}"
+        return None, str(e)
     if not any(target == root or root in target.parents for root in allowed):
-        return f"Cannot read {path}: outside {', '.join(str(r) for r in allowed)}"
+        return None, f"outside {', '.join(str(r) for r in allowed)}"
     if target.is_dir():
-        return f"Cannot read {path}: it is a directory"
+        return None, "it is a directory"
+    return target, ""
+
+
+def is_binary(target: Path) -> bool:
+    """Tell a binary file from a text one by the first bytes of its content.
+
+    Only READ_PROBE_BYTES are looked at, and a file that cannot be opened is
+    not binary, so the caller reports it as unreadable instead.
+
+    Args:
+        target: an already resolved path.
+
+    Returns:
+        True if the file looks binary, False if it looks like text or is
+        missing.
+    """
+    try:
+        with target.open("rb") as handle:
+            return b"\0" in handle.read(READ_PROBE_BYTES)
+    except OSError:
+        return False
+
+
+def binary_paths_note(prompt: str) -> str:
+    """Add the paths of the binary files a prompt names, with their sizes.
+
+    The contents of a binary file never reach the model, so a prompt such as
+    "what is in blood.jpg?" would otherwise leave it guessing which file is
+    meant. The path and the size are appended to the message instead, plus a
+    hint when one of them is an image the model can ask to see. A name that is
+    not a file, or a text file, is left out.
+
+    Args:
+        prompt: the prompt as typed or transcribed.
+
+    Returns:
+        A note to append to the message, or an empty string when the prompt
+        names no binary file.
+    """
+    noted: list[str] = []
+    seeable: bool = False
+    for name in dict.fromkeys(PROMPT_PATH_RE.findall(prompt)):
+        target, _ = resolve_read_path(name)
+        if target is None or not is_binary(target):
+            continue
+        try:
+            size = target.stat().st_size
+        except OSError:
+            continue
+        noted.append(f"{name} ({size} bytes)")
+        seeable = seeable or target.suffix.lower() in IMAGE_MIME_TYPES
+    if not noted:
+        return ""
+    note = BINARY_PATH_NOTE.format(paths=", ".join(noted))
+    return f"\n{note} {IMAGE_HINT}" if seeable else f"\n{note}"
+
+
+def read_file(path: str) -> str:
+    """Read a local file on behalf of the model and return its contents.
+
+    The path is resolved inside the READ_ROOTS directories (see
+    resolve_read_path). Directories and unreadable files are reported as a
+    short sentence the model can report back, a binary file is not read at all
+    and only its path and size are sent, and a file bigger than READ_MAX_BYTES
+    is sent truncated rather than dropped.
+
+    Args:
+        path: the file to read, as the model asked for it.
+
+    Returns:
+        The file contents prefixed with line numbers, or a message explaining
+        why it could not be read.
+    """
+    target, reason = resolve_read_path(path)
+    if target is None:
+        return f"Cannot read {path}: {reason}"
+    if is_binary(target):
+        return (
+            f"{path} is a binary file of {target.stat().st_size} bytes; it was not "
+            f"read, only its path {target} is known"
+        )
     try:
         with target.open("rb") as handle:
             data = handle.read(READ_MAX_BYTES + 1)
     except OSError as e:
         return f"Cannot read {path}: {e.strerror or e}"
-    if b"\0" in data:
-        return f"Cannot read {path}: it looks like a binary file"
     truncated = len(data) > READ_MAX_BYTES
     text = data[:READ_MAX_BYTES].decode("utf-8", errors="replace")
     lines = text.splitlines()
@@ -297,17 +415,104 @@ def read_file(path: str) -> str:
     return f"Contents of {path} ({len(lines)} lines):\n{numbered}{note}"
 
 
+def read_image(path: str) -> str | list[dict[str, Any]]:
+    """Attach an image file so the model can look at it.
+
+    The model takes images as base64 data URLs in an `image_url` part of a
+    message, which is what this builds: the file is read from inside the
+    READ_ROOTS directories (see resolve_read_path) and returned as the content
+    parts of the next message. A path outside the roots, a file that is not one
+    of the IMAGE_MIME_TYPES formats, or one bigger than IMAGE_MAX_BYTES is
+    reported as a short sentence the model can pass on.
+
+    Args:
+        path: the image to attach, as the model asked for it.
+
+    Returns:
+        The content parts of the next message, with the image attached, or a
+        message explaining why it could not be attached.
+    """
+    target, reason = resolve_read_path(path)
+    if target is None:
+        return f"Cannot attach {path}: {reason}"
+    mime = IMAGE_MIME_TYPES.get(target.suffix.lower())
+    if mime is None:
+        known = ", ".join(sorted(IMAGE_MIME_TYPES))
+        return f"Cannot attach {path}: not an image format ({known} are supported)"
+    try:
+        size = target.stat().st_size
+        if size > IMAGE_MAX_BYTES:
+            return (
+                f"Cannot attach {path}: it is {size} bytes, at most "
+                f"{IMAGE_MAX_BYTES} are attached — tell the user to make it smaller"
+            )
+        encoded = base64.b64encode(target.read_bytes()).decode("ascii")
+    except OSError as e:
+        return f"Cannot attach {path}: {e.strerror or e}"
+    return [
+        {"type": "text", "text": f"Image: {path} ({mime}, {size} bytes)"},
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+    ]
+
+
+def image_note(parts: list[dict[str, Any]]) -> str:
+    """Return the text of a message built by read_image, without the image.
+
+    Args:
+        parts: the content parts of the message.
+
+    Returns:
+        The text of the first text part, or an empty string.
+    """
+    texts = [part.get("text", "") for part in parts if part.get("type") == "text"]
+    return texts[0] if texts else ""
+
+
+def drop_stale_images(messages: list[dict[str, Any]]) -> None:
+    """Keep the bytes of the newest IMAGE_HISTORY_KEEP images only.
+
+    An image costs hundreds of kilobytes of base64 in every request made after
+    it, so the data of the older ones is dropped and their text note says so:
+    the model can ask for such a file again with [IMAGE: path]. A limit of 0
+    drops every image as soon as the turn is answered.
+
+    Args:
+        messages: the conversation history, edited in place.
+
+    Returns:
+        None
+    """
+    if IMAGE_HISTORY_KEEP <= 0:
+        return
+    attached = [
+        message
+        for message in messages
+        if isinstance(message["content"], list)
+        and any(part.get("type") == "image_url" for part in message["content"])
+    ]
+    for message in attached[:-IMAGE_HISTORY_KEEP]:
+        note = image_note(message["content"])
+        message["content"] = [{"type": "text", "text": f"{note}\n{IMAGE_DROPPED}"}]
+
+
 # Tools the model can ask for by writing a tag into its reply: the tag name, the
-# pattern that recognizes it, and the function that carries it out. Both return
-# text that is fed back to the model as the next message.
-TOOLS: dict[str, tuple[re.Pattern[str], Callable[[str], str]]] = {
+# pattern that recognizes it, and the function that carries it out. Each returns
+# the content of the next message: text for the tools that answer with text,
+# content parts for the ones that attach an image.
+TOOLS: dict[
+    str, tuple[re.Pattern[str], Callable[[str], str | list[dict[str, Any]]]]
+] = {
     "SEARCH": (SEARCH_RE, search_web),
     "READ": (READ_RE, read_file),
+    "IMAGE": (IMAGE_RE, read_image),
 }
 
 
-def chat(messages: list[dict[str, str]], session_id: str) -> str:
+def chat(messages: list[dict[str, Any]], session_id: str) -> str:
     """Send a chat request to Ollama and return the model's response.
+
+    The request is also written to LAST_PROMPT_FILE, so the prompt behind the
+    answer can be read afterwards.
 
     Args:
         messages: list of message dicts with "role" ("system" | "user" | "assistant")
@@ -320,14 +525,14 @@ def chat(messages: list[dict[str, str]], session_id: str) -> str:
     Raises:
         URLError, KeyError, or json.JSONDecodeError if the request fails.
     """
-    payload = json.dumps(
-        {
-            "model": MODEL,
-            "messages": messages,
-            "stream": False,
-            "session_id": session_id,
-        }
-    ).encode("utf-8")
+    request = {
+        "model": MODEL,
+        "messages": messages,
+        "stream": False,
+        "session_id": session_id,
+    }
+    save_last_prompt(request)
+    payload = json.dumps(request).encode("utf-8")
 
     req = urllib.request.Request(
         OLLAMA_URL,
@@ -340,6 +545,71 @@ def chat(messages: list[dict[str, str]], session_id: str) -> str:
         data = json.loads(resp.read().decode("utf-8"))
 
     return data["choices"][0]["message"]["content"]
+
+
+def without_media_data(content: Any) -> Any:
+    """Copy a message content with the payload of its media parts taken out.
+
+    An image or a recording is a long base64 string that would make the saved
+    prompt unreadable and huge, so each media part keeps its type and a
+    placeholder. The text parts are left as they are.
+
+    Args:
+        content: the content of a message, text or a list of parts.
+
+    Returns:
+        The same content with the media payloads replaced, the very same
+        object when it is plain text.
+    """
+    if not isinstance(content, list):
+        return content
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if part.get("type") == "image_url":
+            parts.append(
+                {"type": "image_url", "image_url": {"url": f"data:...{MEDIA_LOGGED}"}}
+            )
+        elif part.get("type") == "input_audio":
+            audio = {**part.get("input_audio", {})}
+            audio["data"] = MEDIA_LOGGED
+            parts.append({"type": "input_audio", "input_audio": audio})
+        else:
+            parts.append(dict(part))
+    return parts
+
+
+def save_last_prompt(request: dict[str, Any]) -> None:
+    """Write the request sent to the model to LAST_PROMPT_FILE.
+
+    The file is replaced on every request, so it always holds the prompt the
+    last answer was made from: the system prompt, the whole history and the
+    last user message, as JSON. It is written indented and unescaped, to stay
+    readable, and the base64 of an image or a recording is replaced by a
+    placeholder, which would otherwise fill the whole file. A file that cannot
+    be written is ignored, since keeping the prompt must never break the
+    dialog.
+
+    Args:
+        request: the request body sent to Ollama.
+
+    Returns:
+        None
+    """
+    logged = {
+        **request,
+        "messages": [
+            {**message, "content": without_media_data(message["content"])}
+            for message in request.get("messages", [])
+        ],
+    }
+    try:
+        path = Path(LAST_PROMPT_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(logged, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
 
 
 def init_input_history() -> None:
@@ -759,7 +1029,7 @@ def enable_voice_output() -> bool:
     return True
 
 
-def ask_model(messages: list[dict[str, str]], session_id: str) -> str | None:
+def ask_model(messages: list[dict[str, Any]], session_id: str) -> str | None:
     """Send the history to the model and report the usual failures.
 
     Args:
@@ -779,7 +1049,7 @@ def ask_model(messages: list[dict[str, str]], session_id: str) -> str | None:
     return None
 
 
-def agent_turn(messages: list[dict[str, str]], session_id: str) -> str | None:
+def agent_turn(messages: list[dict[str, Any]], session_id: str) -> str | None:
     """Answer the last user message, running the tools the model asks for.
 
     A reply carrying a tool tag such as [SEARCH: query] or [READ: path] is not
@@ -813,11 +1083,15 @@ def agent_turn(messages: list[dict[str, str]], session_id: str) -> str | None:
             break
         name, tool, argument = call
         print(f"[{name.lower()}] {argument}", flush=True)
-        # The result is asked for as a plain message, with a reminder to answer
-        # from it: a small model tends to write another tag instead.
-        messages.append(
-            {"role": "user", "content": f"{tool(argument)}\n\n{ANSWER_FROM_RESULT}"}
-        )
+        # A tool answers with text, or with content parts when it attaches an
+        # image. Either way a reminder to answer follows, since a small model
+        # tends to write another tag instead of answering.
+        result = tool(argument)
+        if isinstance(result, str):
+            result = f"{result}\n\n{ANSWER_FROM_RESULT}"
+        else:
+            result = [*result, {"type": "text", "text": ANSWER_FROM_RESULT}]
+        messages.append({"role": "user", "content": result})
         reply = ask_model(messages, session_id)
         if reply is None:
             return None
@@ -826,6 +1100,7 @@ def agent_turn(messages: list[dict[str, str]], session_id: str) -> str | None:
     # Enforce history limit by dropping oldest messages after index 1
     if len(messages) > HISTORY_LIMIT:
         del messages[1 : len(messages) - (HISTORY_LIMIT - 1)]
+    drop_stale_images(messages)
 
     return reply
 
@@ -858,7 +1133,7 @@ def main() -> None:
     init_input_history()
     # Initialize conversation with system prompt and at least one dummy message
     # to ensure context is available on first user input
-    messages: list[dict[str, str]] = [
+    messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
     speak_replies = False
@@ -891,8 +1166,9 @@ def main() -> None:
                 if not line:
                     continue
 
-            # Add user message to conversation history
-            messages.append({"role": "user", "content": line})
+            # Add user message to conversation history, telling the model which
+            # of the files it names are binary, since they are not read.
+            messages.append({"role": "user", "content": line + binary_paths_note(line)})
 
             print("Thinking...", flush=True)
 

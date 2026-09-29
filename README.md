@@ -28,6 +28,8 @@ Type your prompt and press Enter. The agent sends the full conversation history 
 
 Press Up/Down to walk through the commands you already entered and repeat one (standard readline editing, so Ctrl+A/E/K and other shortcuts work too). The command history is saved to `~/.local/share/ai-python-agent/history` when the agent exits, so prompts from previous sessions are also available with the Up arrow; the last `HISTORY_LIMIT` (32) entries are kept. Set `HISTORY_FILE` in `agent.py` to store it elsewhere.
 
+Every request sent to the model is also written to `~/.local/share/ai-python-agent/last_prompt.json` (constant `LAST_PROMPT_FILE`), replaced on each turn: it holds the system prompt, the whole history and the last user message, indented, so you can see exactly what the model was asked. The file is overwritten even when a turn runs a tool or transcribes a recording, so it always shows the request behind the answer you are looking at.
+
 Example session:
 
 ```
@@ -47,18 +49,27 @@ Bye!
 
 ## Tools
 
-The model can use two tools by writing a tag into its reply. The agent runs the tool, feeds its result back to the model as the next message and asks again, so the tag never reaches you — you only see the final answer. A reply is a tool call at most `MAX_TOOL_ROUNDS` (4) times per prompt, so a model that keeps asking for the same file cannot loop forever.
+The model can use three tools by writing a tag into its reply. The agent runs the tool, feeds its result back to the model as the next message and asks again, so the tag never reaches you — you only see the final answer. A reply is a tool call at most `MAX_TOOL_ROUNDS` (4) times per prompt, so a model that keeps asking for the same file cannot loop forever.
 
 | Tag | What it does | What the model gets back |
 | --- | --- | --- |
 | `[SEARCH: query]` | searches DuckDuckGo, and adds the current weather when the query mentions it | up to 5 results as numbered title + snippet pairs |
-| `[READ: path]` | reads a local file | the contents prefixed with line numbers, so it can cite them |
+| `[READ: path]` | reads a local file | the contents prefixed with line numbers, so it can cite them; a binary file is not read, only its path and size |
+| `[IMAGE: path]` | attaches an image file | the picture itself, as a base64 `image_url` part, which the model can look at |
 
 Ask in plain language — "what is in README.md?", "compare agent.py and test_agent.py" — and the model decides whether it needs a tool. You can see what it did while it thinks: the agent prints `[read] agent.py` or `[search] ...` for every call.
 
 A tag counts only when it is alone on its line, which is how the system prompt asks for it: an answer that merely mentions the syntax (a summary of this very file, for instance) does not run anything.
 
-Reads are confined to `READ_ROOTS`, which defaults to the directory the agent was started in: a relative path is taken from there, `~` is expanded, symlinks are followed, and the resolved path must still be inside one of the roots, so `../` cannot reach the rest of the filesystem. A missing file, a directory, an unreadable file or a binary one is reported back to the model as a short sentence, and a file bigger than `READ_MAX_BYTES` is sent truncated with a note, so a huge file cannot blow up the context.
+Reads are confined to `READ_ROOTS`, which defaults to the directory the agent was started in: a relative path is taken from there, `~` is expanded, symlinks are followed, and the resolved path must still be inside one of the roots, so `../` cannot reach the rest of the filesystem. A missing file, a directory or an unreadable file is reported back to the model as a short sentence, and a file bigger than `READ_MAX_BYTES` is sent truncated with a note, so a huge file cannot blow up the context. A binary file is recognized by the first `READ_PROBE_BYTES` (8192) bytes and is never read past that: the model gets the path and the size, so it can tell you where the file is and what it is, but no bytes of it reach the context. For the same reason a prompt naming a binary file carries the path with it: typing "compare blood.jpg and notes.txt" sends the prompt plus `Files named in this prompt that are binary, given by path and size only: blood.jpg (342822 bytes). An image among them can be attached with [IMAGE: path] to be seen.`, so the model knows what you meant and can ask to see the picture. Names that are not files, and text files, are left out and the prompt is sent as typed. The same path check applies to a dictated prompt.
+
+### Images
+
+Gemma 4 is a multimodal model, so the agent can hand it a picture: the model writes `[IMAGE: blood.jpg]` and the next request carries the file as a base64 `image_url` part, which the model then describes — ask "что показывает blood.jpg?" and the answer comes from the pixels. Ask in plain language, as with the other tools.
+
+Only the formats in `IMAGE_MIME_TYPES` are attached (`.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`, `.bmp`); anything else, a file outside `READ_ROOTS` or one bigger than `IMAGE_MAX_BYTES` (5 MB) is reported to the model, which can tell you why it cannot see it. A file that is not an image format is not converted.
+
+An image costs hundreds of kilobytes of base64 in every later request, so only the newest `IMAGE_HISTORY_KEEP` (1) images keep their bytes: older ones stay in the history as a one-line note saying the picture is no longer attached, and the model can ask for the file again. Setting it to 0 attaches an image for one turn only. The saved `last_prompt.json` never holds image or audio data — those parts are written as a placeholder, so the file stays readable.
 
 Constants at the top of `agent.py`:
 
@@ -66,6 +77,10 @@ Constants at the top of `agent.py`:
 | --- | --- | --- |
 | `READ_ROOTS` | `None` (the working directory) | directories the model may read; a list of paths widens it, `[]` opens it to the whole filesystem |
 | `READ_MAX_BYTES` | `200000` | how much of a bigger file is sent before it is cut off |
+| `READ_PROBE_BYTES` | `8192` | how much of a file is looked at to tell text from binary |
+| `IMAGE_MIME_TYPES` | jpg, jpeg, png, gif, webp, bmp | the image formats the model is given; anything else is refused |
+| `IMAGE_MAX_BYTES` | `5000000` | an image bigger than this is not attached |
+| `IMAGE_HISTORY_KEEP` | `1` | how many images stay in the history with their bytes, the older ones are kept as a note |
 | `MAX_TOOL_ROUNDS` | `4` | how many tool results are fed back for one prompt |
 | `ANSWER_FROM_RESULT` | `Answer from this result, do not write a tool tag.` | reminder appended to a tool result, since a small model tends to ask for another tool instead of answering |
 
@@ -117,8 +132,9 @@ Without `piper-tts` and `sounddevice` installed the agent works as before; `/s` 
 - The history is capped at `HISTORY_LIMIT` (32) messages (`agent.py:12`), dropping the oldest turns so the prompt stays within the model's context length.
 - The model URL and name are configurable via the `OLLAMA_URL` and `MODEL` constants at the top of `agent.py`.
 - Prompts are persisted to `HISTORY_FILE` (`~/.local/share/ai-python-agent/history`): loaded on start, saved on exit, capped at `HISTORY_LIMIT` entries.
+- Every request is also written to `LAST_PROMPT_FILE` (`~/.local/share/ai-python-agent/last_prompt.json`), overwritten on each turn, so the last prompt the model was given — system prompt, whole history and the last user message, as indented JSON — can be read afterwards to see why it answered the way it did. A file that cannot be written is ignored.
 - Voice prompts are recorded with `sounddevice` (16 kHz mono, Enter stops the recording) and the WAV is sent to the model, which returns the transcript; that transcript is just another text user message in the same history.
-- A reply carrying a `[SEARCH: ...]` or `[READ: ...]` tag is answered by running that tool (`agent_turn()`), appending its result to the history and asking the model again; the reply without a tag is the one that is printed and spoken.
+- A reply carrying a `[SEARCH: ...]`, `[READ: ...]` or `[IMAGE: ...]` tag is answered by running that tool (`agent_turn()`), appending its result to the history and asking the model again; the reply without a tag is the one that is printed and spoken. The `[IMAGE: ...]` result is not text but content parts — a line naming the file and the picture as an `image_url` — so a message can be a list of parts, and only the newest few images keep their bytes.
 - Replies are spoken with a cached Piper voice, chosen per reply from the language detected in its text, and played through the default output device with `sounddevice`; only the speakable part of the reply is rendered.
 
 ## Tests

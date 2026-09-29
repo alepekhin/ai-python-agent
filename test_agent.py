@@ -248,6 +248,10 @@ class AgentTTYTest(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
         agent.HISTORY_FILE = str(Path(self.tmpdir.name) / "state" / "history")
+        agent.LAST_PROMPT_FILE = str(
+            Path(self.tmpdir.name) / "state" / "last_prompt.json"
+        )
+        self.addCleanup(setattr, agent, "LAST_PROMPT_FILE", agent.LAST_PROMPT_FILE)
         agent.TTS_DIR = str(Path(self.tmpdir.name) / "state" / "voices")
         # Read the files the test creates, not the ones in the real project.
         agent.READ_ROOTS = [self.tmpdir.name]
@@ -416,6 +420,42 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("Cannot read notes.txt", self._last_user_prompts()[-1])
         self.assertIn("Assistant: There is no such file.", output)
 
+    def test_read_of_binary_file_gives_the_path_only(self) -> None:
+        picture = Path(self.tmpdir.name) / "blood.jpg"
+        picture.write_bytes(b"\xff\xd8\xff\xe0JPEGBYTES\x00data")
+        output = self._run_agent(
+            ["what is in blood.jpg?\n", "\n"],
+            responses=["[READ: blood.jpg]", "It is a photo, I cannot show it."],
+        )
+        self.assertIn("[read] blood.jpg", output)
+        sent = self._last_user_prompts()[-1]
+        self.assertIn("blood.jpg", sent)
+        self.assertIn("binary file", sent)
+        # No byte of the file itself reached the model.
+        self.assertNotIn("JPEGBYTES", sent)
+        self.assertIn("Assistant: It is a photo, I cannot show it.", output)
+
+    def test_prompt_naming_a_binary_file_carries_its_path_to_the_model(self) -> None:
+        picture = Path(self.tmpdir.name) / "blood.jpg"
+        picture.write_bytes(b"\xff\xd8\xff\xe0JPEGBYTES\x00data")
+        (Path(self.tmpdir.name) / "notes.txt").write_text("hello\n", "utf-8")
+        output = self._run_agent(
+            ["compare blood.jpg and notes.txt\n", "\n"], responses=["REPLY"]
+        )
+        sent = self._last_user_prompts()[0]
+        self.assertIn("binary", sent)
+        self.assertIn("blood.jpg", sent)
+        # A text file is not named in the note: the model can read it anyway.
+        self.assertNotIn("notes.txt", sent.split("\n", 1)[1])
+        # No byte of the binary file itself reaches the model.
+        self.assertNotIn("JPEGBYTES", sent)
+        self.assertIn("You: compare blood.jpg and notes.txt", output)
+
+    def test_prompt_without_a_binary_file_is_sent_unchanged(self) -> None:
+        (Path(self.tmpdir.name) / "notes.txt").write_text("hello\n", "utf-8")
+        self._run_agent(["what is in notes.txt?\n", "\n"], responses=["REPLY"])
+        self.assertEqual(self._last_user_prompts()[0], "what is in notes.txt?")
+
     def test_read_stays_inside_the_allowed_directories(self) -> None:
         secret = Path(self.tmpdir.name).parent / "secret.txt"
         secret.write_text("top secret\n", encoding="utf-8")
@@ -448,12 +488,123 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("[read] a.txt", output)
         self.assertIn("Bye!", output)
 
+    def test_image_attached_to_the_request(self) -> None:
+        picture = Path(self.tmpdir.name) / "blood.jpg"
+        picture.write_bytes(b"\xff\xd8\xff\xe0JPEGBYTES\x00data")
+        output = self._run_agent(
+            ["что на картинке blood.jpg\n", "\n"],
+            responses=["[IMAGE: blood.jpg]", "Это анализ крови."],
+        )
+        self.assertIn("[image] blood.jpg", output)
+        self.assertIn("Assistant: Это анализ крови.", output)
+        # The second request carries the picture as a base64 data URL.
+        urls = self._image_urls(FakeOllamaHandler.payloads[-1])
+        self.assertEqual(len(urls), 1)
+        self.assertTrue(urls[0].startswith("data:image/jpeg;base64,"))
+        self.assertIn(base64.b64encode(picture.read_bytes()).decode(), urls[0])
+        texts = self._part_texts(FakeOllamaHandler.payloads[-1])
+        self.assertIn("blood.jpg", texts)
+        self.assertIn(agent.ANSWER_FROM_RESULT, texts)
+
+    def test_image_of_a_file_that_is_not_one_is_refused(self) -> None:
+        (Path(self.tmpdir.name) / "notes.txt").write_text("hello\n", "utf-8")
+        self._run_agent(
+            ["look at notes.txt\n", "\n"],
+            responses=["[IMAGE: notes.txt]", "It is a text file."],
+        )
+        self.assertIn("not an image format", self._last_user_prompts()[-1])
+        self.assertEqual(self._image_urls(FakeOllamaHandler.payloads[-1]), [])
+
+    def test_image_outside_the_allowed_directories_is_refused(self) -> None:
+        secret = Path(self.tmpdir.name).parent / "secret.png"
+        secret.write_bytes(b"\x89PNG\r\n\x1a\n\x00data")
+        self.addCleanup(secret.unlink)
+        self._run_agent(
+            ["look at the secret\n", "\n"],
+            responses=[f"[IMAGE: {secret}]", "I cannot see it."],
+        )
+        self.assertIn("outside", self._last_user_prompts()[-1])
+
+    def test_image_bigger_than_the_cap_is_not_attached(self) -> None:
+        (Path(self.tmpdir.name) / "big.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"x" * 99
+        )
+        old = agent.IMAGE_MAX_BYTES
+        agent.IMAGE_MAX_BYTES = 10
+        self.addCleanup(setattr, agent, "IMAGE_MAX_BYTES", old)
+        self._run_agent(
+            ["look at big.png\n", "\n"], responses=["[IMAGE: big.png]", "No."]
+        )
+        self.assertIn("at most 10 are attached", self._last_user_prompts()[-1])
+        self.assertEqual(self._image_urls(FakeOllamaHandler.payloads[-1]), [])
+
+    def test_older_image_is_dropped_from_the_history(self) -> None:
+        for name in ("one.jpg", "two.jpg"):
+            (Path(self.tmpdir.name) / name).write_bytes(
+                b"\xff\xd8\xff\xe0" + name.encode()
+            )
+        self._run_agent(
+            ["one", "two", "three", ""],
+            responses=[
+                "[IMAGE: one.jpg]",
+                "One.",
+                "[IMAGE: two.jpg]",
+                "Two.",
+                "Three.",
+            ],
+        )
+        # The third turn carries the newest image, and a note where the older
+        # one was: its bytes are not sent again.
+        last = FakeOllamaHandler.payloads[-1]
+        self.assertEqual(len(self._image_urls(last)), 1)
+        parts = self._part_texts(last)
+        self.assertIn("two.jpg", parts)
+        self.assertEqual(parts.count(agent.IMAGE_DROPPED), 1)
+        self.assertIn("one.jpg", parts)
+
+    def test_saved_prompt_holds_no_image_data(self) -> None:
+        (Path(self.tmpdir.name) / "blood.jpg").write_bytes(
+            b"\xff\xd8\xff\xe0" + b"x" * 40
+        )
+        self._run_agent(
+            ["look at blood.jpg\n", "\n"],
+            responses=["[IMAGE: blood.jpg]", "It shows a blood test."],
+        )
+        saved = Path(agent.LAST_PROMPT_FILE).read_text(encoding="utf-8")
+        self.assertIn(agent.MEDIA_LOGGED, saved)
+        self.assertNotIn(
+            base64.b64encode(b"\xff\xd8\xff\xe0" + b"x" * 40).decode(), saved
+        )
+
     def _last_user_prompts(self) -> list[str]:
         return [
             m["content"]
             for m in FakeOllamaHandler.payloads[-1]["messages"]
             if m["role"] == "user" and isinstance(m["content"], str)
         ]
+
+    def _image_urls(self, payload: dict[str, typing.Any]) -> list[str]:
+        """URL of every `image_url` part the model was sent in this request."""
+        return [
+            part["image_url"]["url"]
+            for message in payload["messages"]
+            if isinstance(message["content"], list)
+            for part in message["content"]
+            if part["type"] == "image_url"
+        ]
+
+    def _part_texts(self, payload: dict[str, typing.Any]) -> str:
+        """Every text part of a request, plus its plain text messages."""
+        return "\n".join(
+            part["text"]
+            for message in payload["messages"]
+            for part in (
+                [{"type": "text", "text": message["content"]}]
+                if isinstance(message["content"], str)
+                else message["content"]
+            )
+            if part["type"] == "text"
+        )
 
     def _audio_blocks(self) -> list[dict[str, typing.Any]]:
         """Audio blocks of every `input_audio` part the model was sent."""
@@ -514,6 +665,22 @@ class AgentTTYTest(unittest.TestCase):
         history = [agent.readline.get_history_item(i + 1) for i in range(length)]
         self.assertEqual(len(history), agent.HISTORY_LIMIT)
         self.assertEqual(history[-1], f"old prompt {agent.HISTORY_LIMIT + 4}")
+
+    def test_last_prompt_sent_to_the_model_is_saved(self) -> None:
+        self._run_agent(["привет", ""], responses=["REPLY"])
+        saved = json.loads(Path(agent.LAST_PROMPT_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(saved["model"], "test-model")
+        self.assertEqual(saved["messages"][0]["role"], "system")
+        self.assertEqual(saved["messages"][-1]["content"], "привет")
+        # The file holds the request, written unescaped so it stays readable.
+        self.assertIn("привет", Path(agent.LAST_PROMPT_FILE).read_text("utf-8"))
+
+    def test_last_prompt_file_holds_the_turn_that_ran_a_tool(self) -> None:
+        (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", "utf-8")
+        self._run_agent(["check a.txt", ""], responses=["[READ: a.txt]", "Alpha."])
+        saved = json.loads(Path(agent.LAST_PROMPT_FILE).read_text(encoding="utf-8"))
+        contents = [m["content"] for m in saved["messages"]]
+        self.assertIn("Contents of a.txt (1 lines):\n1: alpha", contents[-1])
 
     def test_voice_prompt_is_sent_as_audio_and_transcribed_by_the_model(
         self,

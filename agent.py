@@ -50,7 +50,8 @@ For service/website descriptions: summarize what they offer.
 Weather example: if snippet says 'hourly forecast with precipitation/wind/UV',
 report that info is available and describe the content.
 Never say 'I cannot find' when results are provided.
-Only search when needed — otherwise use general knowledge."""
+Only search when needed — otherwise use general knowledge.
+Provide respones in Russian"""
 
 MAX_SEARCH_RESULTS: int = 5  # max results to show per search
 OPEN_METEO_GEO: str = "https://geocoding-api.open-meteo.com/v1/search"

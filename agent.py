@@ -1284,9 +1284,9 @@ def main() -> None:
     Up/Down arrows recall previously entered commands, including prompts from
     earlier sessions, when readline is available. Typing /v instead of a prompt
     records it from the microphone, has the model transcribe the recording and
-    sends the transcript as the prompt. Typing /s toggles spoken replies: the
-    assistant's answer is then read out loud with Piper, in addition to being
-    printed.
+    sends the transcript as the prompt. Spoken replies are on from the start:
+    every answer is read out loud with Piper in addition to being printed, and
+    typing /s mutes and unmutes them.
 
     Args:
         None
@@ -1301,11 +1301,12 @@ def main() -> None:
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
-    speak_replies = False
     print(f"AI agent — using model: {MODEL}")
     print(f"Type {VOICE_COMMAND} to speak your prompt.")
-    print(f"Type {SPEAK_COMMAND} to hear the replies.")
     print("Press Enter with an empty prompt to exit.\n")
+    # Spoken replies are on from the start; /s mutes and unmutes them
+    speak_replies = enable_voice_output()
+    print()
 
     try:
         while True:

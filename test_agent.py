@@ -1142,6 +1142,38 @@ class AgentTTYTest(unittest.TestCase):
         self.assertEqual(calls["spoken"], [])
         self.assertEqual(calls["played"], [])
 
+    def test_translate_command_sends_its_prompt(self) -> None:
+        with fake_voice_modules():
+            output = self._run_agent(
+                [agent.TRANSLATE_COMMAND, "what is the weather", ""],
+                responses=["FIRST", "SECOND"],
+            )
+        self.assertIn("Assistant: FIRST", output)
+        self.assertIn("Assistant: SECOND", output)
+        self.assertEqual(
+            self._last_user_prompts(),
+            [agent.TRANSLATE_PROMPT, "what is the weather"],
+        )
+
+    def test_translate_command_is_kept_in_input_history(self) -> None:
+        with fake_voice_modules():
+            self._run_agent([agent.TRANSLATE_COMMAND, ""], responses=["REPLY"])
+        history = Path(agent.HISTORY_FILE).read_text(encoding="utf-8")
+        self.assertIn(agent.TRANSLATE_COMMAND, history)
+
+    def test_translate_command_ru_sends_its_prompt(self) -> None:
+        with fake_voice_modules():
+            output = self._run_agent(
+                [agent.TRANSLATE_COMMAND_RU, "какая погода", ""],
+                responses=["FIRST", "SECOND"],
+            )
+        self.assertIn("Assistant: FIRST", output)
+        self.assertIn("Assistant: SECOND", output)
+        self.assertEqual(
+            self._last_user_prompts(),
+            [agent.TRANSLATE_PROMPT_RU, "какая погода"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

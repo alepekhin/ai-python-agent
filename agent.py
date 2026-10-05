@@ -122,6 +122,7 @@ Weather example: if snippet says 'hourly forecast with precipitation/wind/UV',
 report that info is available and describe the content.
 Never say 'I cannot find' when results are provided.
 Only search or read when needed — otherwise use general knowledge.
+Accept and print voice prompt in Russian.
 Provide respones in Russian"""
 
 MAX_SEARCH_RESULTS: int = 5  # max results to show per search
@@ -132,6 +133,13 @@ WEATHER_RE: re.Pattern[str] = re.compile(
     r"\b(weather|temperature|forecast|rain|snow|wind|humid|cloud|sunny|storm)\b",
     re.IGNORECASE,
 )
+
+# Typing one of these sends the prompt of that language in place of the
+# command, telling the model that the prompts to follow are written in it.
+TRANSLATE_COMMAND: str = "/e"
+TRANSLATE_PROMPT: str = "translate next prompts from English to Russian"
+TRANSLATE_COMMAND_RU: str = "/r"
+TRANSLATE_PROMPT_RU: str = "translate next prompts from Russian to English"
 
 VOICE_COMMAND: str = "/v"  # type the prompt instead of typing it
 VOICE_SAMPLE_RATE: int = 16000  # sample rate of the WAV sent to the model
@@ -1286,7 +1294,9 @@ def main() -> None:
     records it from the microphone, has the model transcribe the recording and
     sends the transcript as the prompt. Spoken replies are on from the start:
     every answer is read out loud with Piper in addition to being printed, and
-    typing /s mutes and unmutes them.
+    typing /s mutes and unmutes them. Typing /e sends TRANSLATE_PROMPT to the
+    model, which then answers the English prompts to follow in Russian; /r sends
+    TRANSLATE_PROMPT_RU, for Russian prompts answered in English.
 
     Args:
         None
@@ -1315,6 +1325,13 @@ def main() -> None:
             # Exit conditions: empty input or /q command
             if not line or line.strip() == "/q":
                 break
+
+            # Language command: send its prompt in place of the command, so the
+            # model is told which language the prompts to follow are written in
+            if line.strip() == TRANSLATE_COMMAND:
+                line = TRANSLATE_PROMPT
+            elif line.strip() == TRANSLATE_COMMAND_RU:
+                line = TRANSLATE_PROMPT_RU
 
             # Voice output toggle: speak every reply, or mute again
             if line.strip() == SPEAK_COMMAND:

@@ -15,6 +15,7 @@ Print and say response
 - Tools the model can ask for by writing a tag in its reply: `[SEARCH: query]` (web search) and `[READ: path]` (local file), limited to `READ_ROOTS` (the working directory by default)
 - Voice input on `/v`: a 2-second pause (or Enter) ends the recording, which is sent to the model as a WAV and transcribed by the model itself
 - Voice output with local Piper TTS, toggled by `/s` (text is always printed too), voice picked per reply: Russian for Cyrillic replies, English otherwise
+- `/e` sends the prompt "translate next prompts from English to Russian", `/r` the same from Russian to English, so prompts to follow are answered in the other language
 - Works locally without internet
 - Works on computer with 16 Gb memory
 

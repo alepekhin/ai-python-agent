@@ -141,6 +141,17 @@ TRANSLATE_PROMPT: str = "translate next prompts from English to Russian"
 TRANSLATE_COMMAND_RU: str = "/r"
 TRANSLATE_PROMPT_RU: str = "translate next prompts from Russian to English"
 
+HELP_COMMAND: str = "/?"  # show help for slash commands
+HELP_TEXT: str = """Commands:
+  /? - show this help
+  /q - quit (or empty prompt)
+  /s - toggle voice output
+  /v - record voice prompt
+  /e - next prompts English -> answer Russian
+  /r - next prompts Russian -> answer English
+  /? - show this help
+"""
+
 VOICE_COMMAND: str = "/v"  # type the prompt instead of typing it
 VOICE_SAMPLE_RATE: int = 16000  # sample rate of the WAV sent to the model
 VOICE_BLOCK_MS: int = 100  # microphone read block size
@@ -735,7 +746,8 @@ def remember_prompt(line: str) -> None:
     """
     if readline is None:
         return
-    if not line.strip() or line.strip() == "/q":
+    stripped = line.strip()
+    if not stripped or stripped == "/q" or stripped == HELP_COMMAND or stripped == SPEAK_COMMAND:
         return
     length = readline.get_current_history_length()
     if not length or readline.get_history_item(length) != line:
@@ -1312,11 +1324,10 @@ def main() -> None:
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
     print(f"AI agent — using model: {MODEL}")
-    print(f"Type {VOICE_COMMAND} to speak your prompt.")
+    print(f"Type {VOICE_COMMAND} to speak your prompt, or {HELP_COMMAND} for help.")
     print("Press Enter with an empty prompt to exit.\n")
-    # Spoken replies are on from the start; /s mutes and unmutes them
-    speak_replies = enable_voice_output()
-    print()
+    # Spoken replies are off by default; /s toggles them on
+    speak_replies = False
 
     try:
         while True:
@@ -1328,13 +1339,19 @@ def main() -> None:
 
             # Language command: send its prompt in place of the command, so the
             # model is told which language the prompts to follow are written in
-            if line.strip() == TRANSLATE_COMMAND:
+            stripped = line.strip()
+            if stripped == TRANSLATE_COMMAND:
                 line = TRANSLATE_PROMPT
-            elif line.strip() == TRANSLATE_COMMAND_RU:
+            elif stripped == TRANSLATE_COMMAND_RU:
                 line = TRANSLATE_PROMPT_RU
 
+            # Help: show available commands
+            if stripped == HELP_COMMAND:
+                print(HELP_TEXT)
+                continue
+
             # Voice output toggle: speak every reply, or mute again
-            if line.strip() == SPEAK_COMMAND:
+            if stripped == SPEAK_COMMAND:
                 if speak_replies:
                     speak_replies = False
                     print("Voice output off.\n")

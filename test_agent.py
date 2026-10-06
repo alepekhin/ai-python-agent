@@ -265,6 +265,10 @@ class AgentTTYTest(unittest.TestCase):
         )
         self.addCleanup(setattr, agent, "LAST_PROMPT_FILE", agent.LAST_PROMPT_FILE)
         agent.TTS_DIR = str(Path(self.tmpdir.name) / "state" / "voices")
+        # Spoken replies are off unless a test turns them on, so a run that
+        # does not fake the voice modules never touches real audio.
+        agent.SPEAK_DEFAULT = False
+        self.addCleanup(setattr, agent, "SPEAK_DEFAULT", True)
         # Read the files the test creates, not the ones in the real project.
         agent.READ_ROOTS = [self.tmpdir.name]
         self.addCleanup(setattr, agent, "READ_ROOTS", None)
@@ -983,7 +987,16 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("Assistant: REPLY", output)
         self.assertEqual(self._last_user_prompts(), ["hello"])
 
-    def test_reply_not_spoken_by_default(self) -> None:
+    def test_reply_spoken_by_default(self) -> None:
+        agent.SPEAK_DEFAULT = True
+        with fake_voice_modules() as calls:
+            output = self._run_agent(["hello", ""], responses=["REPLY"])
+        self.assertIn("Voice output on", output)
+        self.assertIn("Assistant: REPLY", output)
+        self.assertEqual(calls["spoken"], [(agent.PIPER_VOICE_EN, "REPLY")])
+        self.assertEqual(len(calls["played"]), 1)
+
+    def test_reply_not_spoken_when_voice_output_is_off(self) -> None:
         with fake_voice_modules() as calls:
             output = self._run_agent(["hello", ""], responses=["REPLY"])
         self.assertIn("Assistant: REPLY", output)

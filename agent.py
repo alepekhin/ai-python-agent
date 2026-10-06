@@ -145,7 +145,7 @@ HELP_COMMAND: str = "/?"  # show help for slash commands
 HELP_TEXT: str = """Commands:
   /? - show this help
   /q - quit (or empty prompt)
-  /s - toggle voice output
+  /s - toggle voice output (on by default)
   /v - record voice prompt
   /e - next prompts English -> answer Russian
   /r - next prompts Russian -> answer English
@@ -189,6 +189,7 @@ TRANSCRIBE_PROMPT: str = (
 )
 
 SPEAK_COMMAND: str = "/s"  # toggle spoken replies
+SPEAK_DEFAULT: bool = True  # spoken replies are on unless muted with /s
 # One Piper voice per language, picked automatically from the reply's script.
 # Any name from `python -m piper.download_voices` works.
 PIPER_VOICE_EN: str = "en_US-lessac-medium"
@@ -1326,8 +1327,9 @@ def main() -> None:
     print(f"AI agent — using model: {MODEL}")
     print(f"Type {VOICE_COMMAND} to speak your prompt, or {HELP_COMMAND} for help.")
     print("Press Enter with an empty prompt to exit.\n")
-    # Spoken replies are off by default; /s toggles them on
-    speak_replies = False
+    # Spoken replies start on unless SPEAK_DEFAULT says otherwise; /s mutes
+    # and unmutes them, so a missing voice package only mutes the dialog
+    speak_replies = enable_voice_output() if SPEAK_DEFAULT else False
 
     try:
         while True:

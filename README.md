@@ -16,7 +16,7 @@ python3 -m venv .venv
 sudo apt install libportaudio2   # PortAudio backend for sounddevice (macOS: brew install portaudio)
 ```
 
-Run the agent with the venv interpreter (`.venv/bin/python agent.py`); `run_debug.sh` picks it up automatically. Without these packages the agent still works for typed prompts: `/v` prints the voice input install hint, and `/s` prints the voice output one.
+Run the agent with the venv interpreter (`.venv/bin/python agent.py`); `run_debug.sh` picks it up automatically. Without these packages the agent still works for typed prompts: `/v` prints the voice input install hint, and spoken replies are skipped with the voice output install hint.
 
 ## Usage
 
@@ -36,9 +36,9 @@ Example session:
 
 ```
 AI agent — using model: gemma4:latest
-Type /v to speak your prompt.
-Type /s to hear the replies.
+Type /v to speak your prompt, or /? for help.
 Press Enter with an empty prompt to exit.
+Voice output on — en_US-lessac-medium / ru_RU-denis-medium, picked per reply. Type /s again to mute.
 
 You: hi
 Thinking...
@@ -114,11 +114,11 @@ Without `sounddevice` installed the agent works for typed prompts; `/v` just pri
 
 ## Voice output
 
-Type `/s` to toggle spoken replies: from then on every answer is read out loud, in addition to being printed. Type `/s` again to mute. The toggle lasts for the session, and `/q` or an empty prompt still ends the dialog.
+Replies are read out loud from the start: every answer is spoken in addition to being printed. Type `/s` to mute, and `/s` again to speak them; the toggle lasts for the session, and `/q` or an empty prompt still ends the dialog. Set `SPEAK_DEFAULT` to `False` for a silent start.
 
 The voice is [Piper](https://github.com/OHF-Voice/piper1-gpl) — a small ONNX neural TTS that runs on the CPU, so it stays well inside 16 GB of RAM and synthesizes roughly 15–30x faster than real time (playback itself takes as long as the reply is long). The language of every reply is detected from its script, and the matching voice is used: a mostly Cyrillic reply is read by `ru_RU-denis-medium`, anything else by `en_US-lessac-medium`. A reply that mixes both is named after the script it mostly uses, so a Russian answer with a few English words still gets the Russian voice.
 
-Each voice (~60 MB) is downloaded the first time it is needed into `TTS_DIR` and cached on disk, so later sessions need no internet and only the languages you actually chat in are downloaded. The default voice is loaded while the toggle is confirmed, so the first answer is spoken without a delay; switching to another language for the first time prints a short download notice.
+Each voice (~60 MB) is downloaded the first time it is needed into `TTS_DIR` and cached on disk, so later sessions need no internet and only the languages you actually chat in are downloaded. The default voice is loaded at startup, so the first answer is spoken without a delay; switching to another language for the first time prints a short download notice.
 
 Replies are cleaned up before speaking: code blocks are dropped, raw URLs are replaced by a word in the spoken language ("link" / "ссылка"), inline markup like `**bold**` and `[text](url)` is reduced to its text, and only the first `TTS_MAX_CHARS` (1200) characters are read out, so a long answer is not a minute and a half of talking. Press Ctrl+C to stop the voice and end the dialog.
 
@@ -126,7 +126,8 @@ Related constants at the top of `agent.py`:
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
-| `SPEAK_COMMAND` | `/s` | command that toggles voice output |
+| `SPEAK_COMMAND` | `/s` | command that mutes and unmutes spoken replies |
+| `SPEAK_DEFAULT` | `True` | spoken replies are on from the start |
 | `PIPER_VOICE_EN` | `en_US-lessac-medium` | voice for replies that are not mostly Cyrillic |
 | `PIPER_VOICE_RU` | `ru_RU-denis-medium` | voice for mostly Cyrillic replies (`irina`, `dmitri` and `ruslan` also exist) |
 | `PIPER_USE_CUDA` | `False` | set to `True` to run the voice on an NVIDIA GPU (needs `onnxruntime-gpu`) |
@@ -135,7 +136,7 @@ Related constants at the top of `agent.py`:
 
 Run `python -m piper.download_voices` for the full list of voices; any language can be added by pointing `TTS_VOICES` at a new name and a matching entry in `TTS_LINK_WORDS`.
 
-Without `piper-tts` and `sounddevice` installed the agent works as before; `/s` just prints the install hint. If synthesis or playback fails mid-session, the error is printed and the voice is muted, while the dialog continues.
+Without `piper-tts` and `sounddevice` installed the agent works as before; the missing packages are reported at startup and `/s` prints the install hint again. If synthesis or playback fails mid-session, the error is printed and the voice is muted, while the dialog continues.
 
 ## How it works
 

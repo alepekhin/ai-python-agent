@@ -120,7 +120,7 @@ The voice is [Piper](https://github.com/OHF-Voice/piper1-gpl) — a small ONNX n
 
 Each voice (~60 MB) is downloaded the first time it is needed into `TTS_DIR` and cached on disk, so later sessions need no internet and only the languages you actually chat in are downloaded. The default voice is loaded at startup, so the first answer is spoken without a delay; switching to another language for the first time prints a short download notice.
 
-Replies are cleaned up before speaking: code blocks are dropped, raw URLs are replaced by a word in the spoken language ("link" / "ссылка"), inline markup like `**bold**` and `[text](url)` is reduced to its text, and only the first `TTS_MAX_CHARS` (1200) characters are read out, so a long answer is not a minute and a half of talking. Press Ctrl+C to stop the voice and end the dialog.
+Replies are cleaned up before speaking: code blocks are dropped, raw URLs are replaced by a word in the spoken language ("link" / "ссылка"), inline markup like `**bold**` and `[text](url)` is reduced to its text, and only the first `TTS_MAX_CHARS` (1200) characters are read out, so a long answer is not a minute and a half of talking. Press Ctrl+C while a reply is being read out loud to stop the audio and go straight back to the prompt — the dialog stays open, only at the prompt does Ctrl+C still end it.
 
 Related constants at the top of `agent.py`:
 

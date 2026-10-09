@@ -1159,7 +1159,8 @@ def speak(text: str) -> None:
 
     The voice matching the reply's script is used and loaded on first use.
     Playback blocks until it finishes, so the next prompt appears only when the
-    voice is done. Ctrl+C stops the audio and leaves the dialog.
+    voice is done. Ctrl+C stops the audio and propagates, so the caller can go
+    back to the prompt and keep the dialog going.
 
     Args:
         text: the assistant reply; only its speakable part is rendered.
@@ -1302,6 +1303,9 @@ def main() -> None:
       - /q command
       - Ctrl+C
 
+    Ctrl+C pressed while a reply is being read out loud is different: it stops
+    the audio, prints "Voice stopped." and shows the prompt again.
+
     Up/Down arrows recall previously entered commands, including prompts from
     earlier sessions, when readline is available. Typing /v instead of a prompt
     records it from the microphone, has the model transcribe the recording and
@@ -1385,7 +1389,8 @@ def main() -> None:
             print(f"Assistant: {reply}\n")
 
             # Read the reply out loud when voice output is on; a TTS problem is
-            # reported and mutes the voice, but never breaks the dialog.
+            # reported and mutes the voice, but never breaks the dialog, and
+            # Ctrl+C only cuts the speech short.
             if speak_replies:
                 try:
                     speak(reply)
@@ -1393,7 +1398,9 @@ def main() -> None:
                     print(f"Error: {TTS_HINT} (missing: {e.name})")
                     speak_replies = False
                 except KeyboardInterrupt:
-                    break
+                    # Ctrl+C cuts the speech short; the audio is already
+                    # stopped by speak() and the dialog goes on
+                    print("Voice stopped.")
                 except (OSError, RuntimeError, ValueError) as e:
                     print(f"Error: voice output failed ({e})")
                     speak_replies = False

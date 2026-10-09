@@ -109,6 +109,7 @@ def fake_voice_modules(
     mic_error: bool = False,
     tts_error: bool = False,
     levels: list[float] | None = None,
+    interrupt_wait: bool = False,
 ) -> typing.Iterator[dict[str, typing.Any]]:
     """Install fake sounddevice/piper modules for the duration.
 
@@ -118,6 +119,8 @@ def fake_voice_modules(
         tts_error: make the fake Piper voice fail to load.
         levels: RMS level of each block the fake microphone delivers; by
                 default a quiet room and a word in it.
+        interrupt_wait: make waiting for playback raise KeyboardInterrupt,
+                as Ctrl+C does while a reply is being read out loud.
 
     Yields:
         A dict recording the voice files requested/downloaded, the text
@@ -164,7 +167,8 @@ def fake_voice_modules(
         calls["played"].append((len(data), samplerate))
 
     def wait() -> None:
-        pass
+        if interrupt_wait:
+            raise KeyboardInterrupt
 
     def stop() -> None:
         pass
@@ -1039,6 +1043,22 @@ class AgentTTYTest(unittest.TestCase):
             calls["spoken"],
             [(agent.PIPER_VOICE_EN, "FIRST"), (agent.PIPER_VOICE_EN, "SECOND")],
         )
+
+    def test_ctrl_c_while_speaking_stops_the_voice_and_keeps_the_dialog(
+        self,
+    ) -> None:
+        with fake_voice_modules(interrupt_wait=True) as calls:
+            output = self._run_agent(
+                [agent.SPEAK_COMMAND, "hello", "again", ""],
+                responses=["FIRST", "SECOND"],
+                markers=[b"You: "] * 4,
+            )
+        self.assertIn("Assistant: FIRST", output)
+        self.assertIn("Assistant: SECOND", output)
+        # Every reply has its speech cut short, and the dialog goes on.
+        self.assertEqual(output.count("Voice stopped."), 2)
+        self.assertEqual(len(calls["played"]), 2)
+        self.assertIn("Bye!", output)
 
     def test_russian_reply_spoken_with_russian_voice(self) -> None:
         with fake_voice_modules() as calls:

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Interactive CLI AI agent with conversation history, web search and file reads."""
 
+import argparse
 import base64
 import functools
 import html
+import http.server
 import io
 import json
 import os
 import re
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -51,6 +54,14 @@ HISTORY_FILE: str = str(
 LAST_PROMPT_FILE: str = str(
     Path.home() / ".local" / "share" / "ai-python-agent" / "last_prompt.json"
 )
+# Web server mode (`--serve`): the same agent over HTTP, one conversation per
+# session id. Conversations are dropped when this many exist, the least
+# recently used first, so a server left running cannot grow without end.
+SERVER_HOST: str = "127.0.0.1"
+SERVER_PORT: int = 8765
+SESSION_LIMIT: int = 64
+# A request body bigger than this is refused instead of read into memory.
+REQUEST_MAX_BYTES: int = 8_000_000
 DDG_URL: str = "https://html.duckduckgo.com/html/"
 # A tool tag counts only on a line of its own, the way the system prompt asks
 # for it: a model that quotes the syntax in an answer is not asking for a tool.
@@ -633,6 +644,11 @@ def without_media_data(content: Any) -> Any:
     return parts
 
 
+# The saved prompt is one file, so writes are serialized: a server answering
+# several requests at a time must not interleave them into a broken JSON.
+LAST_PROMPT_LOCK = threading.Lock()
+
+
 def save_last_prompt(request: dict[str, Any]) -> None:
     """Write the request sent to the model to LAST_PROMPT_FILE.
 
@@ -657,14 +673,15 @@ def save_last_prompt(request: dict[str, Any]) -> None:
             for message in request.get("messages", [])
         ],
     }
-    try:
-        path = Path(LAST_PROMPT_FILE)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(logged, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except OSError:
-        pass
+    with LAST_PROMPT_LOCK:
+        try:
+            path = Path(LAST_PROMPT_FILE)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(logged, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
 
 
 def init_input_history() -> None:
@@ -1216,27 +1233,40 @@ def enable_voice_output() -> bool:
     return True
 
 
-def ask_model(messages: list[dict[str, Any]], session_id: str) -> str | None:
+def ask_model(
+    messages: list[dict[str, Any]], session_id: str, errors: list[str] | None = None
+) -> str | None:
     """Send the history to the model and report the usual failures.
 
     Args:
         messages: the conversation history, sent as is.
         session_id: unique session identifier for the conversation.
+        errors: when given, the reason of a failure is appended to it, for a
+                caller that shows the failure somewhere else than the terminal
+                (the web server sends it back as the HTTP error).
 
     Returns:
         The model's reply, or None if the model could not be reached or
         answered something unexpected (the reason is printed).
     """
+    message: str = ""
     try:
         return chat(messages, session_id)
     except urllib.error.URLError as e:
-        print(f"Error: cannot reach Ollama ({e.reason})")
+        message = f"cannot reach Ollama ({e.reason})"
     except (KeyError, json.JSONDecodeError) as e:
-        print(f"Error: unexpected response from Ollama ({e})")
+        message = f"unexpected response from Ollama ({e})"
+    print(f"Error: {message}")
+    if errors is not None:
+        errors.append(message)
     return None
 
 
-def agent_turn(messages: list[dict[str, Any]], session_id: str) -> str | None:
+def agent_turn(
+    messages: list[dict[str, Any]],
+    session_id: str,
+    errors: list[str] | None = None,
+) -> str | None:
     """Answer the last user message, running the tools the model asks for.
 
     A reply carrying a tool tag such as [SEARCH: query] or [READ: path] is not
@@ -1247,12 +1277,14 @@ def agent_turn(messages: list[dict[str, Any]], session_id: str) -> str | None:
     Args:
         messages: the conversation history, extended in place.
         session_id: unique session identifier for the conversation.
+        errors: when given, the reason of a failure is appended to it (see
+                ask_model).
 
     Returns:
         The answer to show to the user, or None if a request failed (the
         reason is printed and the dialog ends).
     """
-    reply = ask_model(messages, session_id)
+    reply = ask_model(messages, session_id, errors)
     if reply is None:
         return None
     messages.append({"role": "assistant", "content": reply})
@@ -1279,7 +1311,7 @@ def agent_turn(messages: list[dict[str, Any]], session_id: str) -> str | None:
         else:
             result = [*result, {"type": "text", "text": ANSWER_FROM_RESULT}]
         messages.append({"role": "user", "content": result})
-        reply = ask_model(messages, session_id)
+        reply = ask_model(messages, session_id, errors)
         if reply is None:
             return None
         messages.append({"role": "assistant", "content": reply})
@@ -1409,5 +1441,301 @@ def main() -> None:
         print("Bye!")
 
 
+# Web server mode (`--serve`): the same agent over HTTP. A conversation is
+# kept per session id, so a client that sends the id back keeps its history;
+# a request without one gets a conversation of its own.
+
+
+class Conversation:
+    """One client's dialog with the model: its history, guarded by a lock."""
+
+    def __init__(self) -> None:
+        self.session_id: str = uuid.uuid4().hex
+        self.messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+        # Held for a whole turn, so two requests of one session never run
+        # against the same history at once.
+        self.lock = threading.Lock()
+
+    def ask(self, content: Any) -> tuple[str | None, str | None]:
+        """Answer one prompt with this conversation's history.
+
+        Args:
+            content: the user message, plain text or content parts.
+
+        Returns:
+            (reply, error): the answer, or None and the reason of the failure.
+            A prompt that got no answer is taken back, so the history keeps
+            only turns that were answered.
+        """
+        with self.lock:
+            before = len(self.messages)
+            self.messages.append({"role": "user", "content": content})
+            errors: list[str] = []
+            reply = agent_turn(self.messages, self.session_id, errors)
+            if reply is None:
+                del self.messages[before:]
+                return None, (errors[0] if errors else "the model did not answer")
+            return reply, None
+
+
+# The conversations of a running server. CONVERSATIONS_LOCK guards the dict,
+# its order and the taking of a conversation lock; it is never held while a
+# turn is running.
+CONVERSATIONS: dict[str, Conversation] = {}
+CONVERSATIONS_LOCK = threading.Lock()
+
+
+def conversation(session_id: str | None) -> Conversation:
+    """Find the conversation of a session, or start a new one.
+
+    Args:
+        session_id: the session the client asks to continue, None for a new
+                    conversation — and also for an id that has been forgotten.
+
+    Returns:
+        The conversation to ask, its lock still free for the caller.
+    """
+    with CONVERSATIONS_LOCK:
+        conv = CONVERSATIONS.get(session_id) if session_id else None
+        if conv is None:
+            conv = Conversation()
+            CONVERSATIONS[conv.session_id] = conv
+            while len(CONVERSATIONS) > SESSION_LIMIT:
+                if not drop_oldest_conversation():
+                    break  # every conversation is answering: keep them all
+        else:
+            # A plain dict keeps insertion order, so putting the conversation
+            # back marks it as the most recently used one.
+            CONVERSATIONS[conv.session_id] = CONVERSATIONS.pop(conv.session_id)
+    return conv
+
+
+def drop_oldest_conversation() -> bool:
+    """Forget the least recently used conversation that is not answering now.
+
+    One in the middle of a turn is skipped, since its client is waiting for
+    the reply. Called with CONVERSATIONS_LOCK held, which is also what makes
+    taking a conversation lock here safe: no other thread can pick it up.
+
+    Returns:
+        True when a conversation was dropped, False when all are busy.
+    """
+    for session_id, old in list(CONVERSATIONS.items()):
+        if old.lock.acquire(blocking=False):
+            CONVERSATIONS.pop(session_id, None)
+            old.lock.release()
+            return True
+    return False
+
+
+def parse_request(
+    body: bytes, media_type: str, session_header: str | None = None
+) -> tuple[Any, str | None, str | None]:
+    """Take the prompt and the session out of a request body.
+
+    Args:
+        body: the request body.
+        media_type: the media type of the body, without its parameters.
+        session_header: the session id sent as X-Session-Id, used when the
+                        body does not name one.
+
+    Returns:
+        (content, session_id, error): the user message — plain text, or
+        content parts — the session to continue (None starts a new one), and
+        the reason the request cannot be answered (the first two are None
+        then).
+    """
+    session = session_header
+    if media_type == "application/json":
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            return None, None, f"invalid JSON body ({e})"
+        if not isinstance(data, dict):
+            return None, None, "the JSON body must be an object"
+        if "session" in data:
+            if not isinstance(data["session"], str):
+                return None, None, '"session" must be a string'
+            session = data["session"]
+        if isinstance(data.get("prompt"), str):
+            prompt: str = data["prompt"]
+            # The model is told which of the named files are binary, the same
+            # way the CLI tells it, since their contents are not sent.
+            content: Any = prompt + binary_paths_note(prompt)
+        elif isinstance(data.get("content"), list):
+            content = data["content"]
+        else:
+            return None, None, 'the body needs "prompt" (text) or "content" (parts)'
+    else:
+        content = body.decode("utf-8", errors="replace")
+
+    if isinstance(content, str) and not content.strip():
+        return None, session, "the prompt is empty"
+    return content, session, None
+
+
+USAGE_TEXT: str = """AI agent over HTTP.
+
+POST /chat with a prompt and get the reply back as JSON:
+  curl -s http://127.0.0.1:8765/chat -d "hello"
+  curl -s http://127.0.0.1:8765/chat -H 'Content-Type: application/json' \\
+       -d '{"prompt": "hello"}'
+
+The body is plain text, or JSON with "prompt" (text) or "content" (content
+parts, as the model API takes them). The answer is {"reply": ..., "session":
+"..."}: send the session back to keep the conversation, or leave it out to
+start a new one. With a plain text body the session can be sent as the
+X-Session-Id header instead.
+
+GET /health tells whether the server is up. GET / is this text.
+"""
+
+
+class AgentHandler(http.server.BaseHTTPRequestHandler):
+    """Answers HTTP requests with the reply of the model.
+
+    A turn runs the tools the model asks for just like the CLI does, and the
+    tool calls it prints are the log of the running server. Voice output is
+    off: nobody is at the terminal to hear it or to stop it with Ctrl+C.
+    """
+
+    def do_GET(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/":
+            self._send_text(200, USAGE_TEXT)
+        elif path == "/health":
+            self._send_json(200, {"status": "ok", "model": MODEL})
+        else:
+            self._send_json(404, {"error": "unknown path"})
+
+    def do_POST(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if path not in ("/", "/chat"):
+            self._send_json(404, {"error": "unknown path, POST the prompt to /chat"})
+            return
+
+        body, error, status = self._read_body()
+        if error is not None:
+            self._send_json(status, {"error": error})
+            return
+
+        media_type = (
+            (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        )
+        content, session_id, error = parse_request(
+            body, media_type, self.headers.get("X-Session-Id")
+        )
+        if error is not None:
+            self._send_json(400, {"error": error})
+            return
+
+        conv = conversation(session_id)
+        reply, error = conv.ask(content)
+        if reply is None:
+            self._send_json(502, {"error": error or "the model did not answer"})
+            return
+        self._send_json(200, {"reply": reply, "session": conv.session_id})
+
+    def _read_body(self) -> tuple[bytes, str | None, int]:
+        """Read the request body, refusing one that is missing or too big.
+
+        Returns:
+            (body, error, status): the body, and the reason and status to
+            answer with when there is no body to read.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return b"", "invalid Content-Length", 400
+        if length <= 0:
+            return b"", "the request has no body", 400
+        if length > REQUEST_MAX_BYTES:
+            return b"", f"a body of {length} bytes is too big", 413
+        return self.rfile.read(length), None, 200
+
+    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        """Answer with a JSON body."""
+        self._send(status, json.dumps(payload, ensure_ascii=False), "application/json")
+
+    def _send_text(self, status: int, text: str) -> None:
+        """Answer with a plain text body."""
+        self._send(status, text, "text/plain")
+
+    def _send(self, status: int, text: str, media_type: str) -> None:
+        """Answer with a body of the given media type."""
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", f"{media_type}; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def serve(host: str = SERVER_HOST, port: int = SERVER_PORT) -> None:
+    """Run the agent as a web server, answering prompts over HTTP.
+
+    Args:
+        host: address to listen on, SERVER_HOST by default.
+        port: port to listen on, SERVER_PORT by default; 0 picks a free one.
+
+    Returns:
+        None
+    """
+    try:
+        server = http.server.ThreadingHTTPServer((host, port), AgentHandler)
+    except OSError as e:
+        print(f"Error: cannot listen on {host}:{port} ({e})")
+        return
+    server.daemon_threads = True
+    served_host, served_port = server.server_address[0], server.server_address[1]
+    print(f"AI agent — using model: {MODEL}")
+    print(f"Serving on http://{served_host}:{served_port}/chat — Ctrl+C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        server.server_close()
+        print("Bye!")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Read the command line: the default run is the interactive CLI.
+
+    Args:
+        argv: the arguments to parse, sys.argv[1:] by default.
+
+    Returns:
+        The parsed arguments.
+    """
+    parser = argparse.ArgumentParser(
+        prog="agent.py",
+        description="An AI agent in the terminal, or the same one over HTTP.",
+    )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="answer prompts sent in HTTP requests instead of at the terminal",
+    )
+    parser.add_argument(
+        "--host",
+        default=SERVER_HOST,
+        help=f"address to listen on with --serve (default: {SERVER_HOST})",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=SERVER_PORT,
+        help=f"port to listen on with --serve (default: {SERVER_PORT})",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    if args.serve:
+        serve(args.host, args.port)
+    else:
+        main()

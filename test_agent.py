@@ -13,6 +13,8 @@ import time
 import types
 import typing
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -226,6 +228,266 @@ def fake_voice_modules(
                 del sys.modules[name]
             else:
                 sys.modules[name] = module
+
+
+class AgentServerTest(unittest.TestCase):
+    """The web server mode: a prompt sent over HTTP comes back as a reply."""
+
+    ollama: http.server.HTTPServer
+    ddg: http.server.HTTPServer
+    web: http.server.ThreadingHTTPServer
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        class QuietAgentHandler(agent.AgentHandler):
+            """The agent's handler without the request log in the test output."""
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        cls.ollama = http.server.HTTPServer(("127.0.0.1", 0), FakeOllamaHandler)
+        threading.Thread(target=cls.ollama.serve_forever, daemon=True).start()
+        cls.ddg = http.server.HTTPServer(("127.0.0.1", 0), FakeDDGHandler)
+        threading.Thread(target=cls.ddg.serve_forever, daemon=True).start()
+        cls.web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), QuietAgentHandler)
+        cls.web.daemon_threads = True
+        threading.Thread(target=cls.web.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.web.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.web.shutdown()
+        cls.web.server_close()
+        cls.ollama.shutdown()
+        cls.ollama.server_close()
+        cls.ddg.shutdown()
+        cls.ddg.server_close()
+
+    def setUp(self) -> None:
+        # The saved prompt of every turn goes to a throwaway file, so the
+        # real one in the user's home directory is never touched.
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        saved = agent.LAST_PROMPT_FILE
+        agent.LAST_PROMPT_FILE = str(Path(self.tmpdir.name) / "last_prompt.json")
+        self.addCleanup(setattr, agent, "LAST_PROMPT_FILE", saved)
+        saved_urls = (agent.OLLAMA_URL, agent.MODEL, agent.DDG_URL)
+        self.addCleanup(setattr, agent, "OLLAMA_URL", saved_urls[0])
+        self.addCleanup(setattr, agent, "MODEL", saved_urls[1])
+        self.addCleanup(setattr, agent, "DDG_URL", saved_urls[2])
+        agent.OLLAMA_URL = (
+            f"http://127.0.0.1:{self.ollama.server_address[1]}/v1/chat/completions"
+        )
+        agent.MODEL = "test-model"
+        agent.DDG_URL = f"http://127.0.0.1:{self.ddg.server_address[1]}/html/"
+        agent.READ_ROOTS = [self.tmpdir.name]
+        self.addCleanup(setattr, agent, "READ_ROOTS", None)
+        FakeOllamaHandler.responses = ["REPLY"]
+        FakeOllamaHandler.payloads = []
+        # Each test starts with no conversations of its own.
+        agent.CONVERSATIONS.clear()
+        self.addCleanup(agent.CONVERSATIONS.clear)
+
+    def _open(
+        self, request: urllib.request.Request
+    ) -> tuple[int, bytes, dict[str, str]]:
+        """Send a request and return its status, body and headers."""
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return response.status, response.read(), dict(response.headers)
+        except urllib.error.HTTPError as e:
+            status, payload, headers = e.code, e.read(), dict(e.headers)
+            e.close()
+            return status, payload, headers
+
+    def _post(
+        self,
+        body: str | bytes | dict[str, typing.Any],
+        path: str = "/chat",
+        content_type: str = "application/json",
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, typing.Any]]:
+        """POST a body and return the status and the decoded JSON answer.
+
+        A dict is sent as JSON, a str or bytes as it is.
+        """
+        if isinstance(body, bytes):
+            data = body
+        elif isinstance(body, str):
+            data = body.encode("utf-8")
+        else:
+            data = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            self.base + path,
+            data=data,
+            headers={"Content-Type": content_type, **(headers or {})},
+            method="POST",
+        )
+        status, payload, _ = self._open(request)
+        return status, json.loads(payload.decode("utf-8"))
+
+    def _get(self, path: str, json_body: bool = True) -> tuple[int, typing.Any]:
+        """GET a path and return the status and the body, decoded as asked."""
+        status, payload, _ = self._open(urllib.request.Request(self.base + path))
+        text = payload.decode("utf-8")
+        return status, (json.loads(text) if json_body else text)
+
+    @staticmethod
+    def _sent_prompts() -> list[str]:
+        """The user messages of the last request the fake model received."""
+        return [
+            message["content"]
+            for message in FakeOllamaHandler.payloads[-1]["messages"]
+            if message["role"] == "user"
+        ]
+
+    def test_prompt_comes_back_as_reply(self) -> None:
+        status, payload = self._post({"prompt": "hello"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["reply"], "REPLY")
+        self.assertTrue(payload["session"])
+        self.assertEqual(self._sent_prompts(), ["hello"])
+
+    def test_plain_text_body_is_the_prompt(self) -> None:
+        status, payload = self._post("hello there", content_type="text/plain")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["reply"], "REPLY")
+        self.assertEqual(self._sent_prompts(), ["hello there"])
+
+    def test_session_keeps_the_conversation(self) -> None:
+        _, first = self._post({"prompt": "first"})
+        status, second = self._post(
+            {"prompt": "second", "session": first["session"]}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(second["session"], first["session"])
+        self.assertEqual(self._sent_prompts(), ["first", "second"])
+
+    def test_session_header_works_with_a_text_body(self) -> None:
+        _, first = self._post({"prompt": "first"})
+        status, second = self._post(
+            "second",
+            content_type="text/plain",
+            headers={"X-Session-Id": first["session"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(second["session"], first["session"])
+        self.assertEqual(self._sent_prompts(), ["first", "second"])
+
+    def test_forgotten_session_starts_a_new_conversation(self) -> None:
+        _, first = self._post({"prompt": "first"})
+        _, second = self._post({"prompt": "second", "session": "gone"})
+        self.assertNotEqual(second["session"], first["session"])
+        self.assertEqual(self._sent_prompts(), ["second"])
+
+    def test_two_requests_of_one_session_share_its_history(self) -> None:
+        _, first = self._post({"prompt": "one"})
+        session = first["session"]
+        answers: list[tuple[int, dict[str, typing.Any]]] = []
+
+        def ask(prompt: str) -> None:
+            answers.append(self._post({"prompt": prompt, "session": session}))
+
+        threads = [
+            threading.Thread(target=ask, args=(prompt,))
+            for prompt in ("first thread", "second thread")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        self.assertEqual([status for status, _ in answers], [200, 200])
+        self.assertEqual(len(FakeOllamaHandler.payloads), 3)
+        prompts = {
+            message["content"]
+            for message in FakeOllamaHandler.payloads[-1]["messages"]
+            if message["role"] == "user"
+        }
+        self.assertEqual(prompts, {"one", "first thread", "second thread"})
+
+    def test_empty_prompt_is_refused(self) -> None:
+        status, payload = self._post({"prompt": "   "})
+        self.assertEqual(status, 400)
+        self.assertIn("empty", payload["error"])
+        self.assertEqual(FakeOllamaHandler.payloads, [])
+
+    def test_body_without_a_prompt_is_refused(self) -> None:
+        status, payload = self._post({})
+        self.assertEqual(status, 400)
+        self.assertIn("prompt", payload["error"])
+        self.assertEqual(FakeOllamaHandler.payloads, [])
+
+    def test_invalid_json_is_refused(self) -> None:
+        status, payload = self._post("{not json")
+        self.assertEqual(status, 400)
+        self.assertIn("invalid JSON", payload["error"])
+
+    def test_json_session_must_be_a_string(self) -> None:
+        status, payload = self._post({"prompt": "hello", "session": 7})
+        self.assertEqual(status, 400)
+        self.assertIn("session", payload["error"])
+
+    def test_body_without_content_is_refused(self) -> None:
+        status, payload = self._post(b"", content_type="text/plain")
+        self.assertEqual(status, 400)
+        self.assertIn("no body", payload["error"])
+
+    def test_unknown_path_is_404(self) -> None:
+        status, _ = self._post({"prompt": "hello"}, path="/nowhere")
+        self.assertEqual(status, 404)
+        status, _ = self._get("/nowhere")
+        self.assertEqual(status, 404)
+
+    def test_health_says_the_model_it_answers_with(self) -> None:
+        status, payload = self._get("/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"status": "ok", "model": "test-model"})
+
+    def test_root_explains_the_api(self) -> None:
+        status, text = self._get("/", json_body=False)
+        self.assertEqual(status, 200)
+        self.assertIn("POST /chat", text)
+
+    def test_tool_reply_is_run_and_not_shown(self) -> None:
+        FakeOllamaHandler.responses = [
+            "[SEARCH: python list comprehension]",
+            "REPLY",
+        ]
+        status, payload = self._post({"prompt": "how do I zip two lists"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["reply"], "REPLY")
+        self.assertEqual(len(FakeOllamaHandler.payloads), 2)
+
+    def test_unreachable_model_is_reported_and_prompt_taken_back(self) -> None:
+        _, first = self._post({"prompt": "first"})
+        session = first["session"]
+        agent.OLLAMA_URL = "http://127.0.0.1:1/v1/chat/completions"
+        status, payload = self._post({"prompt": "lost", "session": session})
+        self.assertEqual(status, 502)
+        self.assertIn("cannot reach Ollama", payload["error"])
+
+        # The prompt that was not answered is not left behind in the history.
+        agent.OLLAMA_URL = (
+            f"http://127.0.0.1:{self.ollama.server_address[1]}/v1/chat/completions"
+        )
+        status, payload = self._post({"prompt": "again", "session": session})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["reply"], "REPLY")
+        self.assertEqual(self._sent_prompts(), ["first", "again"])
+
+    def test_oldest_conversation_is_dropped_at_the_limit(self) -> None:
+        limit = agent.SESSION_LIMIT
+        agent.SESSION_LIMIT = 1
+        self.addCleanup(setattr, agent, "SESSION_LIMIT", limit)
+        _, first = self._post({"prompt": "first"})
+        _, second = self._post({"prompt": "second"})
+        self.assertNotEqual(second["session"], first["session"])
+
+        # The dropped conversation is forgotten, so its id is a new one now.
+        _, restarted = self._post({"prompt": "third", "session": first["session"]})
+        self.assertNotEqual(restarted["session"], first["session"])
+        self.assertEqual(self._sent_prompts(), ["third"])
 
 
 class AgentTTYTest(unittest.TestCase):

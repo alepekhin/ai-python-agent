@@ -49,6 +49,29 @@ You:
 Bye!
 ```
 
+## Web server
+
+The same agent can answer prompts over HTTP instead of at the terminal:
+
+```sh
+.venv/bin/python agent.py --serve                    # 127.0.0.1:8765
+.venv/bin/python agent.py --serve --host 0.0.0.0 --port 9000
+```
+
+Send the prompt, get the reply:
+
+```sh
+curl -s http://127.0.0.1:8765/chat -d "hello"
+curl -s http://127.0.0.1:8765/chat -H 'Content-Type: application/json' \
+     -d '{"prompt": "hello"}'
+```
+
+The answer is `{"reply": "...", "session": "..."}`. Send the session back to keep the conversation (`{"prompt": "...", "session": "..."}`, or the `X-Session-Id` header with a plain text body) and the history, the tools and the `HISTORY_LIMIT` trimming work exactly as in the CLI; leave the session out and a new conversation starts. A JSON body may also carry `"content"` (content parts) instead of `"prompt"`, so a recording or a picture can be sent the way the model API takes them.
+
+A prompt the model could not answer comes back as HTTP 502 with the reason in `"error"`, an empty prompt or a malformed body as 400, an unknown path as 404. `GET /health` answers `{"status": "ok", "model": "..."}`, `GET /` repeats the usage above.
+
+Requests are answered in threads, each conversation under its own lock, so clients can post in parallel; at most `SESSION_LIMIT` (64) conversations are kept, and the least recently used one is dropped. Voice output is off in server mode — nobody is at the terminal to hear it or to stop it with Ctrl+C — while the tool calls of a turn are printed on the terminal as the log of the running server.
+
 ## Tools
 
 The model can use three tools by writing a tag into its reply. The agent runs the tool, feeds its result back to the model as the next message and asks again, so the tag never reaches you — you only see the final answer. A reply is a tool call at most `MAX_TOOL_ROUNDS` (4) times per prompt, so a model that keeps asking for the same file cannot loop forever.
@@ -149,10 +172,11 @@ Without `piper-tts` and `sounddevice` installed the agent works as before; the m
 - Voice prompts are recorded with `sounddevice` (16 kHz mono, ended by Enter or by a 2-second pause) and the WAV is sent to the model, which returns the transcript; that transcript is just another text user message in the same history.
 - A reply carrying a `[SEARCH: ...]`, `[READ: ...]` or `[IMAGE: ...]` tag is answered by running that tool (`agent_turn()`), appending its result to the history and asking the model again; the reply without a tag is the one that is printed and spoken. The `[IMAGE: ...]` result is not text but content parts — a line naming the file and the picture as an `image_url` — so a message can be a list of parts, and only the newest few images keep their bytes.
 - Replies are spoken with a cached Piper voice, chosen per reply from the language detected in its text, and played through the default output device with `sounddevice`; only the speakable part of the reply is rendered.
+- `--serve` runs the same turn over HTTP: a `Conversation` (the system prompt plus the history of one session id) is kept per session and guarded by its own lock, while requests run one thread each — different sessions answer in parallel, two requests of one session wait for each other. A turn that failed leaves its history as it was, and the reason of the failure is what the response carries.
 
 ## Tests
 
-The interactive loop is exercised by a test that emulates a TTY (via `pty`) against a fake Ollama server, so no real model is needed. Voice input and voice output are covered too, with a fake `sounddevice`/`piper` and a fake server that answers both the transcription and the chat request:
+The interactive loop is exercised by a test that emulates a TTY (via `pty`) against a fake Ollama server, so no real model is needed. Voice input and voice output are covered too, with a fake `sounddevice`/`piper` and a fake server that answers both the transcription and the chat request. The web server mode is covered by tests that post to a real listening server, again against the fake model:
 
 ```sh
 python3 test_agent.py

@@ -9,6 +9,7 @@ Print and say response
 
 - Use Python3, Ollama, model ollama/gemma4:latest, reached over `/v1/chat/completions` (the only endpoint that takes an audio prompt)  
 - CLI 
+- Web server on `--serve`: a prompt in an HTTP request, the reply in the response, conversation history kept per session id 
 - End dialog with empty prompt (also `/q` or Ctrl+C) 
 - History length should be less than context length (trimmed to `HISTORY_LIMIT` = 32 messages) 
 - Show "Thinking..." while the model responds 

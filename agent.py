@@ -57,7 +57,7 @@ LAST_PROMPT_FILE: str = str(
 # Web server mode (`--serve`): the same agent over HTTP, one conversation per
 # session id. Conversations are dropped when this many exist, the least
 # recently used first, so a server left running cannot grow without end.
-SERVER_HOST: str = "127.0.0.1"
+SERVER_HOST: str = "0.0.0.0"
 SERVER_PORT: int = 8765
 SESSION_LIMIT: int = 64
 # A request body bigger than this is refused instead of read into memory.

@@ -10,6 +10,10 @@ sent back on the next request in the `X-Session-Id` header, so the server keeps
 the conversation history — every message continues the same dialogue until you
 press **Clear**.
 
+The prompt can be typed or dictated: the **Voice** button records the
+microphone and sends the WAV to the server's `/transcribe` endpoint, and the
+returned transcript lands in the prompt box (edit it before sending if needed).
+
 - One screen: a server URL, a multiline box for the text, and the response.
 - The server URL comes from the bundled `assets/server.json` and can be changed
   in the app (saved, and used from then on).
@@ -22,11 +26,12 @@ press **Clear**.
 app/src/main/
 ├── assets/server.json                    # server config file (url, timeoutSeconds)
 ├── java/com/example/httpposter/
-│   ├── MainActivity.kt                   # UI: URL field, prompt, Send/Clear, response
+│   ├── MainActivity.kt                   # UI: URL field, prompt, Send/Clear/Voice, response
 │   ├── ServerConfig.kt                   # loads server.json, saves the URL override
-│   └── HttpPoster.kt                     # the POST request and the reply/session parsing
+│   ├── HttpPoster.kt                     # the POST request and the reply/session parsing
+│   └── VoiceRecorder.kt                  # records the mic into a 16 kHz WAV
 ├── res/layout/activity_main.xml
-└── AndroidManifest.xml                   # INTERNET permission, cleartext HTTP
+└── AndroidManifest.xml                   # INTERNET + RECORD_AUDIO, cleartext HTTP
 ```
 
 ## Requirements
@@ -151,8 +156,10 @@ export PATH=$ANDROID_SDK_ROOT/platform-tools:$PATH
    ```
 
 5. In the app, set the server URL to the PC's LAN address, press **Save**, type
-   a message and press **Send**. The reply appears below; errors (server down,
-   timeout, bad URL) are shown in the response area.
+   (or dictate with **Voice**) a message and press **Send**. The reply appears
+   below; errors (server down, timeout, bad URL) are shown in the response
+   area. The first time **Voice** is used, the app asks for the microphone
+   permission.
 
 ### Run in an emulator (terminal)
 

@@ -62,6 +62,14 @@
             android:layout_marginStart="8dp"
             android:layout_weight="1"
             android:text="@string/clear" />
+
+        <Button
+            android:id="@+id/voiceButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:text="@string/voice" />
     </LinearLayout>
 
     <TextView
@@ -83,6 +91,7 @@
             android:id="@+id/response"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:textColor="@color/black"
             android:textIsSelectable="true"
             android:textSize="16sp" />
     </ScrollView>

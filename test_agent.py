@@ -2,6 +2,7 @@
 import base64
 import contextlib
 import http.server
+import io
 import json
 import os
 import pty
@@ -15,6 +16,7 @@ import typing
 import unittest
 import urllib.error
 import urllib.request
+import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -448,6 +450,41 @@ class AgentServerTest(unittest.TestCase):
         status, text = self._get("/", json_body=False)
         self.assertEqual(status, 200)
         self.assertIn("POST /chat", text)
+
+    @staticmethod
+    def _wav(rate: int = agent.VOICE_SAMPLE_RATE) -> bytes:
+        """A short mono 16-bit WAV with a bit of sound in it."""
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(rate)
+            wav.writeframes(b"\x00" * 320 + b"\x10\x00" * 320)
+        return buffer.getvalue()
+
+    def test_transcribe_returns_the_built_multiplier_of_the_recording(self) -> None:
+        status, payload = self._post(
+            self._wav(), path="/transcribe", content_type="audio/wav"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"text": "REPLY"})
+        # The recording is sent to the model as an input_audio part.
+        sent = FakeOllamaHandler.payloads[-1]["messages"][-1]["content"]
+        self.assertEqual(sent[1]["type"], "input_audio")
+
+    def test_transcribe_refuses_a_body_that_is_not_a_wav(self) -> None:
+        status, payload = self._post(
+            b"not a wav", path="/transcribe", content_type="audio/wav"
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("RIFF", payload["error"])
+
+    def test_transcribe_refuses_the_wrong_sample_rate(self) -> None:
+        status, payload = self._post(
+            self._wav(rate=44_100), path="/transcribe", content_type="audio/wav"
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("16000", payload["error"])
 
     def test_tool_reply_is_run_and_not_shown(self) -> None:
         FakeOllamaHandler.responses = [

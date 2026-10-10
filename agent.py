@@ -1001,6 +1001,36 @@ def encode_wav(audio: Any) -> bytes:
     return buffer.getvalue()
 
 
+def decode_wav(data: bytes) -> Any:
+    """Decode a mono 16-bit WAV file into float32 samples.
+
+    The recordings of the Android app are mono, signed 16-bit PCM at
+    VOICE_SAMPLE_RATE, so they can be fed to transcribe_voice() exactly like
+    the recordings of the CLI.
+
+    Args:
+        data: the WAV file bytes.
+
+    Returns:
+        float32 samples at VOICE_SAMPLE_RATE.
+
+    Raises:
+        ValueError: if the WAV is not a mono 16-bit recording at
+        VOICE_SAMPLE_RATE, which the model cannot transcribe reliably.
+    """
+    import numpy as np
+
+    with wave.open(io.BytesIO(data), "rb") as wav:
+        if wav.getnchannels() != 1:
+            raise ValueError("the recording must be mono")
+        if wav.getsampwidth() != 2:
+            raise ValueError("the recording must be 16-bit PCM")
+        if wav.getframerate() != VOICE_SAMPLE_RATE:
+            raise ValueError(f"the recording must be at {VOICE_SAMPLE_RATE} Hz")
+        pcm = wav.readframes(wav.getnframes())
+    return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+
+
 def transcribe_voice(audio: Any) -> str:
     """Let the model transcribe the recording, by sending it the WAV itself.
 
@@ -1589,6 +1619,11 @@ parts, as the model API takes them). The answer is {"reply": ..., "session":
 start a new one. With a plain text body the session can be sent as the
 X-Session-Id header instead.
 
+POST /transcribe with a raw WAV file (16 kHz, mono, 16-bit PCM) and get the
+spoken text back as {"text": ...}:
+  curl -s http://127.0.0.1:8765/transcribe -H 'Content-Type: audio/wav' \\
+       --data-binary @recording.wav
+
 GET /health tells whether the server is up. GET / is this text.
 """
 
@@ -1612,6 +1647,9 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path
+        if path == "/transcribe":
+            self._handle_transcribe()
+            return
         if path not in ("/", "/chat"):
             self._send_json(404, {"error": "unknown path, POST the prompt to /chat"})
             return
@@ -1637,6 +1675,35 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(502, {"error": error or "the model did not answer"})
             return
         self._send_json(200, {"reply": reply, "session": conv.session_id})
+
+    def _handle_transcribe(self) -> None:
+        """Transcribe a WAV file in the body and answer with its text.
+
+        The body is a raw WAV file, mono 16-bit PCM at VOICE_SAMPLE_RATE,
+        as the Android app records it. The model transcribes the recording
+        itself, the same way /v does in the CLI.
+        """
+        body, error, status = self._read_body()
+        if error is not None:
+            self._send_json(status, {"error": error})
+            return
+        try:
+            audio = decode_wav(body)
+        except (ValueError, wave.Error) as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        if audio.size == 0:
+            self._send_json(400, {"error": "the recording is empty"})
+            return
+        try:
+            text = transcribe_voice(audio)
+        except Exception as e:
+            self._send_json(502, {"error": f"transcription failed ({e})"})
+            return
+        if not text:
+            self._send_json(502, {"error": "the recording was not heard"})
+            return
+        self._send_json(200, {"text": text})
 
     def _read_body(self) -> tuple[bytes, str | None, int]:
         """Read the request body, refusing one that is missing or too big.

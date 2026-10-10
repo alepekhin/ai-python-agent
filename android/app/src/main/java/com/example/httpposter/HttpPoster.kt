@@ -66,6 +66,47 @@ object HttpPoster {
         return reader.use { it.readText() }
     }
 
+    /**
+     * Sends a WAV recording to the server's `/transcribe` and reads back the
+     * spoken text: `{"text": ...}`. Blocking: call from a background thread.
+     */
+    fun transcribe(
+        url: String,
+        wav: ByteArray,
+        timeoutSeconds: Int
+    ): String {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = timeoutSeconds * 1000
+            readTimeout = timeoutSeconds * 1000
+            doOutput = true
+            setRequestProperty("Content-Type", "audio/wav")
+            setRequestProperty("Accept", "application/json")
+        }
+
+        try {
+            connection.outputStream.use { it.write(wav) }
+
+            val status = connection.responseCode
+            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
+            val text = stream?.let { readAll(it.bufferedReader()) } ?: ""
+
+            if (status !in 200..299) {
+                val message = parseError(text) ?: "HTTP $status"
+                throw RuntimeException(message)
+            }
+
+            val json = JSONObject(text)
+            val transcript = json.optString("text", "").trim()
+            if (transcript.isEmpty()) {
+                throw RuntimeException("the server did not return a transcription")
+            }
+            return transcript
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     private fun parseError(text: String): String? {
         if (text.isBlank()) return null
         return try {

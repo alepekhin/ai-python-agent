@@ -68,6 +68,8 @@ curl -s http://127.0.0.1:8765/chat -H 'Content-Type: application/json' \
 
 The answer is `{"reply": "...", "session": "..."}`. Send the session back to keep the conversation (`{"prompt": "...", "session": "..."}`, or the `X-Session-Id` header with a plain text body) and the history, the tools and the `HISTORY_LIMIT` trimming work exactly as in the CLI; leave the session out and a new conversation starts. A JSON body may also carry `"content"` (content parts) instead of `"prompt"`, so a recording or a picture can be sent the way the model API takes them.
 
+`POST /transcribe` with a raw WAV file (16 kHz, mono, 16-bit PCM — what the Android app records) answers with the spoken text: `{"text": "..."}`. The model transcribes the recording itself, exactly like `/v` in the CLI, so a phone can dictate a prompt without any speech recognition on the device.
+
 A prompt the model could not answer comes back as HTTP 502 with the reason in `"error"`, an empty prompt or a malformed body as 400, an unknown path as 404. `GET /health` answers `{"status": "ok", "model": "..."}`, `GET /` repeats the usage above.
 
 Requests are answered in threads, each conversation under its own lock, so clients can post in parallel; at most `SESSION_LIMIT` (64) conversations are kept, and the least recently used one is dropped. Voice output is off in server mode — nobody is at the terminal to hear it or to stop it with Ctrl+C — while the tool calls of a turn are printed on the terminal as the log of the running server.

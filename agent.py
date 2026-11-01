@@ -1654,8 +1654,10 @@ def agent_turn(
         )
         if call is None:
             break
-        name, tool, argument = call
-        called = f"[{name.lower()}]" + (f" {argument}" if argument else "")
+        _, tool, argument = call
+        # The name printed is the tool's own, the one its function carries, so
+        # the log says what actually ran rather than which tag asked for it.
+        called = f"[{tool.__name__}]" + (f" {argument}" if argument else "")
         print(called, flush=True)
         # A tool answers with text, or with content parts when it attaches an
         # image. Either way a reminder to answer follows, since a small model

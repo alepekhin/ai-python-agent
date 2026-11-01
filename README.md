@@ -86,7 +86,7 @@ The model can use five tools by writing a tag into its reply. The agent runs the
 | `[READ: path]` | reads a local file | the contents prefixed with line numbers, so it can cite them; a binary file is not read, only its path and size |
 | `[IMAGE: path]` | attaches an image file | the picture itself, as a base64 `image_url` part, which the model can look at |
 
-Ask in plain language — "what time is it now?", "какая погода в Химози?", "what is in README.md?", "compare agent.py and test_agent.py" — and the model decides whether it needs a tool. You can see what it did while it thinks: the agent prints `[date]`, `[weather]`, `[read] agent.py` or `[search] ...` for every call.
+Ask in plain language — "what time is it now?", "какая погода в Химози?", "what is in README.md?", "compare agent.py and test_agent.py" — and the model decides whether it needs a tool. You can see what it did while it thinks: the agent prints `[current_datetime]`, `[weather_forecast]`, `[read_file] agent.py` or `[search_web] ...` for every call.
 
 A tag counts only when it is alone on its line, which is how the system prompt asks for it: an answer that merely mentions the syntax (a summary of this very file, for instance) does not run anything.
 

@@ -740,7 +740,7 @@ class AgentTTYTest(unittest.TestCase):
             responses=["[SEARCH: current weather]", "It is sunny today."],
         )
         self.assertIn("Thinking...", output)
-        self.assertIn("[search] current weather", output)
+        self.assertIn("[search_web] current weather", output)
         self.assertIn("Assistant: It is sunny today.", output)
 
     def test_search_results_parsed(self) -> None:
@@ -748,7 +748,7 @@ class AgentTTYTest(unittest.TestCase):
             ["search for python\n", "\n"],
             responses=["[SEARCH: python tutorial]", "Here are the results."],
         )
-        self.assertIn("[search] python tutorial", output)
+        self.assertIn("[search_web] python tutorial", output)
         self.assertIn("Assistant: Here are the results.", output)
 
     def test_search_in_middle_of_reply(self) -> None:
@@ -759,7 +759,7 @@ class AgentTTYTest(unittest.TestCase):
                 "Here is what I found.",
             ],
         )
-        self.assertIn("[search] topic x", output)
+        self.assertIn("[search_web] topic x", output)
         self.assertIn("Assistant: Here is what I found.", output)
 
     def test_read_triggered(self) -> None:
@@ -768,7 +768,7 @@ class AgentTTYTest(unittest.TestCase):
             ["what is in notes.txt?\n", "\n"],
             responses=["[READ: notes.txt]", "It says hello and world."],
         )
-        self.assertIn("[read] notes.txt", output)
+        self.assertIn("[read_file] notes.txt", output)
         self.assertIn("Assistant: It says hello and world.", output)
         # The file itself reached the model, as numbered lines.
         self.assertEqual(
@@ -794,7 +794,7 @@ class AgentTTYTest(unittest.TestCase):
             ["read notes.txt\n", "\n"],
             responses=["[READ: notes.txt]", "There is no such file."],
         )
-        self.assertIn("[read] notes.txt", output)
+        self.assertIn("[read_file] notes.txt", output)
         self.assertIn("Cannot read notes.txt", self._last_user_prompts()[-1])
         self.assertIn("Assistant: There is no such file.", output)
 
@@ -805,7 +805,7 @@ class AgentTTYTest(unittest.TestCase):
             ["what is in blood.jpg?\n", "\n"],
             responses=["[READ: blood.jpg]", "It is a photo, I cannot show it."],
         )
-        self.assertIn("[read] blood.jpg", output)
+        self.assertIn("[read_file] blood.jpg", output)
         sent = self._last_user_prompts()[-1]
         self.assertIn("blood.jpg", sent)
         self.assertIn("binary file", sent)
@@ -851,8 +851,8 @@ class AgentTTYTest(unittest.TestCase):
             ["check a.txt\n", "\n"],
             responses=["[READ: a.txt]", "[SEARCH: a.txt meaning]", "Alpha."],
         )
-        self.assertIn("[read] a.txt", output)
-        self.assertIn("[search] a.txt meaning", output)
+        self.assertIn("[read_file] a.txt", output)
+        self.assertIn("[search_web] a.txt meaning", output)
         self.assertIn("Assistant: Alpha.", output)
 
     def test_date_triggered(self) -> None:
@@ -860,7 +860,7 @@ class AgentTTYTest(unittest.TestCase):
             ["what time is it now?\n", "\n"],
             responses=["[DATE]", "It is noon."],
         )
-        self.assertIn("[date]", output)
+        self.assertIn("[current_datetime]", output)
         self.assertIn("Assistant: It is noon.", output)
         # The moment itself reached the model, as an answerable line.
         sent = self._last_user_prompts()[-1]
@@ -873,7 +873,7 @@ class AgentTTYTest(unittest.TestCase):
             ["what time is it in Moscow?\n", "\n"],
             responses=["[DATE: Europe/Moscow]", "It is late there."],
         )
-        self.assertIn("[date] Europe/Moscow", output)
+        self.assertIn("[current_datetime] Europe/Moscow", output)
         sent = self._last_user_prompts()[-1]
         self.assertIn("Timezone: Europe/Moscow", sent)
         self.assertIn("+03:00", sent)
@@ -901,7 +901,7 @@ class AgentTTYTest(unittest.TestCase):
             ["какая погода в Химози?\n", "\n"],
             responses=["[WEATHER]", "Облачно, +7°."],
         )
-        self.assertIn("[weather]", output)
+        self.assertIn("[weather_forecast]", output)
         self.assertIn("Assistant: Облачно, +7°.", output)
         # The forecast itself reached the model, days and all.
         sent = self._last_user_prompts()[-1]
@@ -956,7 +956,7 @@ class AgentTTYTest(unittest.TestCase):
         )
         # One reply to start with, plus one per round the agent is willing to run.
         self.assertEqual(len(FakeOllamaHandler.payloads), agent.MAX_TOOL_ROUNDS + 1)
-        self.assertIn("[read] a.txt", output)
+        self.assertIn("[read_file] a.txt", output)
         self.assertIn("Bye!", output)
 
     def test_image_attached_to_the_request(self) -> None:
@@ -966,7 +966,7 @@ class AgentTTYTest(unittest.TestCase):
             ["что на картинке blood.jpg\n", "\n"],
             responses=["[IMAGE: blood.jpg]", "Это анализ крови."],
         )
-        self.assertIn("[image] blood.jpg", output)
+        self.assertIn("[read_image] blood.jpg", output)
         self.assertIn("Assistant: Это анализ крови.", output)
         # The second request carries the picture as a base64 data URL.
         urls = self._image_urls(FakeOllamaHandler.payloads[-1])

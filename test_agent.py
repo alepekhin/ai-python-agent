@@ -1658,6 +1658,48 @@ class AgentTTYTest(unittest.TestCase):
             [agent.TRANSLATE_PROMPT_RU, "какая погода"],
         )
 
+    def test_default_system_prompt_answers_in_russian(self) -> None:
+        with fake_voice_modules():
+            self._run_agent(["привет", ""], responses=["REPLY"])
+        system = FakeOllamaHandler.payloads[-1]["messages"][0]
+        self.assertEqual(system["role"], "system")
+        self.assertIn("Answer in Russian", system["content"])
+        self.assertNotIn("Answer in English", system["content"])
+
+    def test_translate_command_ru_switches_the_answers_to_english(self) -> None:
+        # The system prompt must name English too, or /r only asks for the
+        # translation while the system prompt still forces Russian answers.
+        with fake_voice_modules():
+            self._run_agent(
+                [agent.TRANSLATE_COMMAND_RU, "какая погода", ""],
+                responses=["FIRST", "SECOND"],
+            )
+        system = FakeOllamaHandler.payloads[-1]["messages"][0]
+        self.assertEqual(system["role"], "system")
+        self.assertIn("Answer in English", system["content"])
+        self.assertNotIn("Answer in Russian", system["content"])
+        # The language comes last, so no rule after it can contradict it.
+        self.assertEqual(
+            system["content"].splitlines()[-1],
+            agent.ANSWER_IN.format(language=agent.REPLY_LANGUAGE_EN),
+        )
+
+    def test_translate_command_e_switches_the_answers_back_to_russian(self) -> None:
+        with fake_voice_modules():
+            self._run_agent(
+                [
+                    agent.TRANSLATE_COMMAND_RU,
+                    "hello",
+                    agent.TRANSLATE_COMMAND,
+                    "привет",
+                    "",
+                ],
+                responses=["ONE", "TWO", "THREE", "FOUR"],
+            )
+        system = FakeOllamaHandler.payloads[-1]["messages"][0]
+        self.assertIn("Answer in Russian", system["content"])
+        self.assertNotIn("Answer in English", system["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

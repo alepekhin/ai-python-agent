@@ -26,7 +26,7 @@ Run the agent with the venv interpreter (`.venv/bin/python agent.py`); `run_debu
 
 Type your prompt and press Enter. The agent sends the full conversation history to the model, so it remembers earlier turns. End the dialog by pressing Enter on an empty prompt (or typing `/q`, or pressing Ctrl+C).
 
-Type `/e` when you start writing prompts in English: the agent sends `translate next prompts from English to Russian` (`TRANSLATE_PROMPT`) instead of the command itself, so the model translates the prompts to follow and keeps answering in Russian. Type `/r` for the other way round (`TRANSLATE_PROMPT_RU`, `translate next prompts from Russian to English`): Russian prompts are answered in English.
+Type `/e` when you start writing prompts in English: the agent sends `translate next prompts from English to Russian` (`TRANSLATE_PROMPT`) instead of the command itself, so the model translates the prompts to follow and keeps answering in Russian. Type `/r` for the other way round (`TRANSLATE_PROMPT_RU`, `translate next prompts from Russian to English`): Russian prompts are answered in English. The language of the answers is one line of the system prompt (`ANSWER_IN`, Russian by default, `DEFAULT_REPLY_LANGUAGE`), which the command rewrites, so the model is never told two languages at once.
 
 Press Up/Down to walk through the commands you already entered and repeat one (standard readline editing, so Ctrl+A/E/K and other shortcuts work too). The command history is saved to `~/.local/share/ai-python-agent/history` when the agent exits, so prompts from previous sessions are also available with the Up arrow; the last `HISTORY_LIMIT` (32) entries are kept. Set `HISTORY_FILE` in `agent.py` to store it elsewhere.
 
@@ -38,7 +38,7 @@ Example session:
 AI agent — using model: gemma4:latest
 Type /v to speak your prompt, or /? for help.
 Press Enter with an empty prompt to exit.
-Voice output on — en_US-lessac-medium / ru_RU-denis-medium, picked per reply. Type /s again to mute.
+Voice output on — en_US-lessac-medium / ru_RU-irina-medium, picked per reply. Type /s again to mute.
 
 You: hi
 Thinking...
@@ -116,6 +116,7 @@ Constants at the top of `agent.py`:
 | `IMAGE_HISTORY_KEEP` | `1` | how many images stay in the history with their bytes, the older ones are kept as a note |
 | `MAX_TOOL_ROUNDS` | `4` | how many tool results are fed back for one prompt |
 | `ANSWER_FROM_RESULT` | `Answer from this result, do not write a tool tag.` | reminder appended to a tool result, since a small model tends to ask for another tool instead of answering |
+| `ANSWER_IN` | `Answer in {language}, whatever language the prompt is written in.` | the last line of the system prompt, naming the language of the answers: `DEFAULT_REPLY_LANGUAGE` (Russian) or `REPLY_LANGUAGE_EN` after `/r` |
 
 ## Voice input
 
@@ -147,7 +148,7 @@ Without `sounddevice` installed the agent works for typed prompts; `/v` just pri
 
 Replies are read out loud from the start: every answer is spoken in addition to being printed. Type `/s` to mute, and `/s` again to speak them; the toggle lasts for the session, and `/q` or an empty prompt still ends the dialog. Set `SPEAK_DEFAULT` to `False` for a silent start.
 
-The voice is [Piper](https://github.com/OHF-Voice/piper1-gpl) — a small ONNX neural TTS that runs on the CPU, so it stays well inside 16 GB of RAM and synthesizes roughly 15–30x faster than real time (playback itself takes as long as the reply is long). The language of every reply is detected from its script, and the matching voice is used: a mostly Cyrillic reply is read by `ru_RU-denis-medium`, anything else by `en_US-lessac-medium`. A reply that mixes both is named after the script it mostly uses, so a Russian answer with a few English words still gets the Russian voice.
+The voice is [Piper](https://github.com/OHF-Voice/piper1-gpl) — a small ONNX neural TTS that runs on the CPU, so it stays well inside 16 GB of RAM and synthesizes roughly 15–30x faster than real time (playback itself takes as long as the reply is long). The language of every reply is detected from its script, and the matching voice is used: a mostly Cyrillic reply is read by `ru_RU-irina-medium`, anything else by `en_US-lessac-medium`. A reply that mixes both is named after the script it mostly uses, so a Russian answer with a few English words still gets the Russian voice.
 
 Each voice (~60 MB) is downloaded the first time it is needed into `TTS_DIR` and cached on disk, so later sessions need no internet and only the languages you actually chat in are downloaded. The default voice is loaded at startup, so the first answer is spoken without a delay; switching to another language for the first time prints a short download notice.
 
@@ -160,7 +161,7 @@ Related constants at the top of `agent.py`:
 | `SPEAK_COMMAND` | `/s` | command that mutes and unmutes spoken replies |
 | `SPEAK_DEFAULT` | `True` | spoken replies are on from the start |
 | `PIPER_VOICE_EN` | `en_US-lessac-medium` | voice for replies that are not mostly Cyrillic |
-| `PIPER_VOICE_RU` | `ru_RU-denis-medium` | voice for mostly Cyrillic replies (`irina`, `dmitri` and `ruslan` also exist) |
+| `PIPER_VOICE_RU` | `ru_RU-irina-medium` | voice for mostly Cyrillic replies (`denis`, `dmitri` and `ruslan` also exist) |
 | `PIPER_USE_CUDA` | `False` | set to `True` to run the voice on an NVIDIA GPU (needs `onnxruntime-gpu`) |
 | `TTS_DIR` | `~/.local/share/ai-python-agent/voices` | where the downloaded voices are cached |
 | `TTS_MAX_CHARS` | `1200` | how much of a long reply is spoken |

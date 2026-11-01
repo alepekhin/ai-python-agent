@@ -167,9 +167,41 @@ For service/website descriptions: summarize what they offer.
 Weather example: if snippet says 'hourly forecast with precipitation/wind/UV',
 report that info is available and describe the content.
 Never say 'I cannot find' when results are provided.
-Only search or read when needed — otherwise use general knowledge.
-Accept and print voice prompt in Russian.
-Provide respones in Russian"""
+Only search or read when needed — otherwise use general knowledge."""
+
+# The answers are written in one language for the whole dialog, and that
+# language is a line of the system prompt: a fixed "answer in Russian" in the
+# prompt itself would fight /r, so the translate commands rewrite this line
+# instead of adding a second, conflicting instruction.
+DEFAULT_REPLY_LANGUAGE: str = "Russian"  # how this agent is used; /r switches
+REPLY_LANGUAGE_EN: str = "English"
+ANSWER_IN: str = "Answer in {language}, whatever language the prompt is written in."
+
+
+def system_prompt(language: str = DEFAULT_REPLY_LANGUAGE) -> str:
+    """Build the system prompt of a dialog answered in `language`.
+
+    Args:
+        language: the language the answers are written in.
+
+    Returns:
+        SYSTEM_PROMPT followed by the line that names the language.
+    """
+    return f"{SYSTEM_PROMPT}\n{ANSWER_IN.format(language=language)}"
+
+
+def set_reply_language(messages: list[dict[str, Any]], language: str) -> None:
+    """Make the model answer in `language` for the rest of the dialog.
+
+    The system message is rewritten rather than a second one appended: a small
+    model follows one system prompt far better than two that disagree, and the
+    rewrite survives the history trimming, which never drops the first message.
+
+    Args:
+        messages: the conversation history, changed in place.
+        language: the language the answers are to be written in.
+    """
+    messages[0] = {"role": "system", "content": system_prompt(language)}
 
 MAX_SEARCH_RESULTS: int = 5  # max results to show per search
 OPEN_METEO_GEO: str = "https://geocoding-api.open-meteo.com/v1/search"
@@ -1668,7 +1700,9 @@ def main() -> None:
     every answer is read out loud with Piper in addition to being printed, and
     typing /s mutes and unmutes them. Typing /e sends TRANSLATE_PROMPT to the
     model, which then answers the English prompts to follow in Russian; /r sends
-    TRANSLATE_PROMPT_RU, for Russian prompts answered in English.
+    TRANSLATE_PROMPT_RU, for Russian prompts answered in English. The answer
+    language is the last line of the system prompt, which the command rewrites,
+    so the translate prompt and the system prompt never name two languages.
 
     Args:
         None
@@ -1681,7 +1715,7 @@ def main() -> None:
     # Initialize conversation with system prompt and at least one dummy message
     # to ensure context is available on first user input
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt()},
     ]
     print(f"AI agent — using model: {MODEL}")
     print(f"Type {VOICE_COMMAND} to speak your prompt, or {HELP_COMMAND} for help.")
@@ -1699,12 +1733,16 @@ def main() -> None:
                 break
 
             # Language command: send its prompt in place of the command, so the
-            # model is told which language the prompts to follow are written in
+            # model is told which language the prompts to follow are written
+            # in, and name the language the answers are written in, so the two
+            # instructions agree instead of fighting each other
             stripped = line.strip()
             if stripped == TRANSLATE_COMMAND:
                 line = TRANSLATE_PROMPT
+                set_reply_language(messages, DEFAULT_REPLY_LANGUAGE)
             elif stripped == TRANSLATE_COMMAND_RU:
                 line = TRANSLATE_PROMPT_RU
+                set_reply_language(messages, REPLY_LANGUAGE_EN)
 
             # Help: show available commands
             if stripped == HELP_COMMAND:
@@ -1775,7 +1813,7 @@ class Conversation:
     def __init__(self) -> None:
         self.session_id: str = uuid.uuid4().hex
         self.messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
+            {"role": "system", "content": system_prompt()}
         ]
         # Held for a whole turn, so two requests of one session never run
         # against the same history at once.

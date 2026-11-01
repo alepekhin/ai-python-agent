@@ -17,6 +17,7 @@ import unittest
 import urllib.error
 import urllib.request
 import wave
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -33,6 +34,33 @@ FAKE_DDG_HTML = """\
   <h2><a class="result__a" href="https://example2.com">Second Result</a></h2>
   <a class="result__snippet" href="https://example2.com">Another snippet with more info.</a>
 </div>
+</body></html>
+"""
+
+
+FAKE_METEO_HTML = """\
+<html><body>
+<div class="last-report">
+<div class="current-temp"><span class="t8">+8&deg;</span><span class="apparent">Ощущается как +7&deg;</span></div>
+<div class="conditions"><div class="main"><ul>
+<li class="condition-descr">облачно</li>
+<li title="Ветер в румбах горизонта (откуда дует)">Ветер: <span>2</span> м/с, южный, юго-восточный</li>
+<li title="Атмосферное давление на уровне станции">Давление: <span>766</span> мм рт.ст.</li>
+<li>Влажность воздуха: <span>71</span>%</li>
+</ul></div>
+<div class="ext forecast"><ul>
+<li class="t8"><div class="ext-wrap"><span class="ext-time">Днём</span><span class="ext-cond"><img src="/img/icons/cloudy.png" alt="Днём Облачно">+7°</span><span class="ext-text">Облачно</span></div></li>
+<li class="t6"><div class="ext-wrap"><span class="ext-time">Вечером</span><span class="ext-cond"><img src="/img/icons/cloudy.png" alt="Вечером Облачно">+6°</span><span class="ext-text">Облачно</span></div></li>
+<li class="t6"><div class="ext-wrap"><span class="ext-time">Ночью</span><span class="ext-cond"><img src="/img/icons/cloudy.png" alt="Ночью Облачно">+5°</span><span class="ext-text">Облачно</span></div></li>
+</ul></div>
+<div class="report-time"><p>Сводка зафиксирована 21 мин назад (в 11:00), в аэропорту Пулково.</p></div>
+</div>
+<div class="clear"></div></div>
+<table id="forecast"><tr>
+<td><!-- Дата и день недели --><div class="dt red"><big title="В воскресенье">вс</big>1 Ноября</div><div class="wtr t8"><img src="/img/icons/cloudy.png" title="Облачно"><big>+7°</big><p>Облачно</p></div><div class="nprt t6">Ночью: <span class="n_tmp">+5°</span></div><div class="inf"><p title="Ветер южный, 1.4 м/с"><span class="v">Ю, 1</span> м/с</p><p title="Атм. давление 1018 гПа"><span class="v">764</span> мм</p><p title="Влажность воздуха 97%"><span class="v">97</span> %</p></div></td>
+<td class="cl"></td>
+<td><div class="dt"><big title="В понедельник">пн</big>2 Ноября</div><div class="wtr t6"><img src="/img/icons/cloudy.png" title="Облачно"><big>+6°</big><p>Облачно</p></div><div class="nprt t4">Ночью: <span class="n_tmp">+4°</span><img class="nPh" src="/img/icons/rain.png" title="Небольшой дождь"></div><div class="inf_r"><p title="Ветер юго-западный, 2.3 м/с"><span class="v">ЮЗ, 2</span> м/с</p><p title="Атм. давление 1014 гПа"><span class="v">760</span> мм</p><p title="Влажность воздуха 88%"><span class="v">88</span> %</p></div></td>
+</tr></table>
 </body></html>
 """
 
@@ -84,6 +112,21 @@ class FakeDDGHandler(http.server.BaseHTTPRequestHandler):
         body = FAKE_DDG_HTML.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+class FakeMeteoHandler(http.server.BaseHTTPRequestHandler):
+    page: typing.ClassVar[bytes] = FAKE_METEO_HTML.encode("utf-8")
+
+    def do_GET(self) -> None:
+        body = self.page
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -530,10 +573,13 @@ class AgentServerTest(unittest.TestCase):
 class AgentTTYTest(unittest.TestCase):
     server: http.server.HTTPServer
     ddg_server: http.server.HTTPServer
+    meteo_server: http.server.HTTPServer
     thread: threading.Thread
     ddg_thread: threading.Thread
+    meteo_thread: threading.Thread
     port: int
     ddg_port: int
+    meteo_port: int
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -549,12 +595,21 @@ class AgentTTYTest(unittest.TestCase):
         cls.ddg_thread.start()
         cls.ddg_port = cls.ddg_server.server_address[1]
 
+        cls.meteo_server = http.server.HTTPServer(("127.0.0.1", 0), FakeMeteoHandler)
+        cls.meteo_thread = threading.Thread(
+            target=cls.meteo_server.serve_forever, daemon=True
+        )
+        cls.meteo_thread.start()
+        cls.meteo_port = cls.meteo_server.server_address[1]
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
         cls.server.server_close()
         cls.ddg_server.shutdown()
         cls.ddg_server.server_close()
+        cls.meteo_server.shutdown()
+        cls.meteo_server.server_close()
 
     def setUp(self) -> None:
         # Point the persisted history and the voice cache at a throwaway
@@ -575,6 +630,10 @@ class AgentTTYTest(unittest.TestCase):
         # Read the files the test creates, not the ones in the real project.
         agent.READ_ROOTS = [self.tmpdir.name]
         self.addCleanup(setattr, agent, "READ_ROOTS", None)
+        # Read the fake forecast page, not the live one of ru-meteo.ru.
+        weather_url = agent.WEATHER_URL
+        agent.WEATHER_URL = f"http://127.0.0.1:{self.meteo_port}/khimozi"
+        self.addCleanup(setattr, agent, "WEATHER_URL", weather_url)
         agent.load_piper.cache_clear()
         self.addCleanup(agent.load_piper.cache_clear)
         if agent.readline is not None:
@@ -795,6 +854,99 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("[read] a.txt", output)
         self.assertIn("[search] a.txt meaning", output)
         self.assertIn("Assistant: Alpha.", output)
+
+    def test_date_triggered(self) -> None:
+        output = self._run_agent(
+            ["what time is it now?\n", "\n"],
+            responses=["[DATE]", "It is noon."],
+        )
+        self.assertIn("[date]", output)
+        self.assertIn("Assistant: It is noon.", output)
+        # The moment itself reached the model, as an answerable line.
+        sent = self._last_user_prompts()[-1]
+        self.assertIn("Current date and time:", sent)
+        self.assertIn("ISO 8601:", sent)
+        self.assertIn(agent.ANSWER_FROM_RESULT, sent)
+
+    def test_date_of_another_timezone(self) -> None:
+        output = self._run_agent(
+            ["what time is it in Moscow?\n", "\n"],
+            responses=["[DATE: Europe/Moscow]", "It is late there."],
+        )
+        self.assertIn("[date] Europe/Moscow", output)
+        sent = self._last_user_prompts()[-1]
+        self.assertIn("Timezone: Europe/Moscow", sent)
+        self.assertIn("+03:00", sent)
+        self.assertIn("Assistant: It is late there.", output)
+
+    def test_current_datetime_is_readable_and_parseable(self) -> None:
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        text = agent.current_datetime()
+        after = datetime.now(timezone.utc)
+        lines = text.splitlines()
+        moment = datetime.fromisoformat(lines[1].removeprefix("ISO 8601: "))
+        self.assertLessEqual(before, moment)
+        self.assertLessEqual(moment, after)
+        self.assertIn(f"{agent.WEEKDAY_NAMES[moment.weekday()]},", lines[0])
+        self.assertIn(f" {agent.MONTH_NAMES[moment.month - 1]} ", lines[0])
+        self.assertIn("Timezone: local time", lines[2])
+
+    def test_unknown_timezone_is_reported(self) -> None:
+        text = agent.current_datetime("Nowhere/Land")
+        self.assertIn("no such timezone", text)
+        self.assertNotIn("Current date and time", text)
+
+    def test_weather_triggered(self) -> None:
+        output = self._run_agent(
+            ["какая погода в Химози?\n", "\n"],
+            responses=["[WEATHER]", "Облачно, +7°."],
+        )
+        self.assertIn("[weather]", output)
+        self.assertIn("Assistant: Облачно, +7°.", output)
+        # The forecast itself reached the model, days and all.
+        sent = self._last_user_prompts()[-1]
+        self.assertIn(f"Weather forecast for {agent.WEATHER_PLACE}", sent)
+        self.assertIn("Now: +8°, облачно (feels like +7°)", sent)
+        self.assertIn("Forecast:", sent)
+        self.assertIn("вс, 1 Ноября", sent)
+        self.assertIn(agent.ANSWER_FROM_RESULT, sent)
+
+    def test_weather_parse_reads_conditions_and_days(self) -> None:
+        forecast = agent.parse_weather(FAKE_METEO_HTML)
+        self.assertIn("Now: +8°, облачно (feels like +7°)", forecast)
+        self.assertIn("Wind: 2 м/с, южный, юго-восточный", forecast)
+        self.assertIn("Pressure: 766 мм рт.ст.", forecast)
+        self.assertIn("Humidity: 71 %", forecast)
+        self.assertIn(
+            "Day parts: Днём +7° Облачно; Вечером +6° Облачно; Ночью +5° Облачно",
+            forecast,
+        )
+        self.assertIn("Report: Сводка зафиксирована", forecast)
+        self.assertIn(
+            "вс, 1 Ноября; day +7° Облачно; night +5°; Ю, 1 м/с, 764 мм, 97 %",
+            forecast,
+        )
+        # A night with its own weather carries it too.
+        self.assertIn("пн, 2 Ноября", forecast)
+        self.assertIn("night +4° (Небольшой дождь)", forecast)
+
+    def test_weather_of_another_place_is_left_to_the_search(self) -> None:
+        forecast = agent.weather_forecast("Гатчина")
+        self.assertIn(f"only for {agent.WEATHER_PLACE}", forecast)
+        self.assertIn("[SEARCH: weather Гатчина]", forecast)
+
+    def test_weather_page_that_is_not_understood_is_reported(self) -> None:
+        self.assertEqual(agent.parse_weather("<html><body>nothing</body></html>"), "")
+        page = FakeMeteoHandler.page
+        FakeMeteoHandler.page = b"<html><body>nothing</body></html>"
+        self.addCleanup(setattr, FakeMeteoHandler, "page", page)
+        self.assertIn("not understood", agent.weather_forecast())
+
+    def test_unreachable_weather_site_is_reported(self) -> None:
+        weather_url = agent.WEATHER_URL
+        agent.WEATHER_URL = "http://127.0.0.1:1/khimozi"
+        self.addCleanup(setattr, agent, "WEATHER_URL", weather_url)
+        self.assertIn("Cannot fetch the weather", agent.weather_forecast())
 
     def test_tool_is_not_run_forever(self) -> None:
         (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", encoding="utf-8")

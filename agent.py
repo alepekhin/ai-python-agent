@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive CLI AI agent with conversation history, web search and file reads."""
+"""Interactive CLI AI agent with conversation history, tools and voice."""
 
 import argparse
 import base64
@@ -19,8 +19,10 @@ import uuid
 import wave
 from collections import deque
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:  # readline is POSIX-only, may be missing on Windows or embedded builds
     import readline
@@ -63,6 +65,20 @@ SESSION_LIMIT: int = 64
 # A request body bigger than this is refused instead of read into memory.
 REQUEST_MAX_BYTES: int = 8_000_000
 DDG_URL: str = "https://html.duckduckgo.com/html/"
+# The forecast page of the village of Khimosi, Leningrad oblast. It is the one
+# place this tool reads: another place would need another page of the site.
+WEATHER_URL: str = "https://ru-meteo.ru/khimozi"
+WEATHER_PLACE: str = "Химози"
+WEATHER_PLACE_NAMES: frozenset[str] = frozenset(
+    {
+        "химози",
+        "khimozi",
+        "деревня химози",
+        "д химози",
+        "derevnya khimozi",
+    }
+)
+WEATHER_TIMEOUT: int = 20  # the page is small, but the site may be slow
 # A tool tag counts only on a line of its own, the way the system prompt asks
 # for it: a model that quotes the syntax in an answer is not asking for a tool.
 SEARCH_RE: re.Pattern[str] = re.compile(
@@ -70,6 +86,18 @@ SEARCH_RE: re.Pattern[str] = re.compile(
 )
 
 READ_RE: re.Pattern[str] = re.compile(r"^[ \t]*\[READ:\s*(.+?)\][ \t]*$", re.MULTILINE)
+# The date and time need no argument, so the tag stands on its own: [DATE].
+# An IANA timezone may follow it, as in [DATE: Europe/Moscow], when the time
+# of another place is asked for; without one the local time is told.
+DATE_RE: re.Pattern[str] = re.compile(
+    r"^[ \t]*\[DATE(?::\s*(.*?))?\][ \t]*$", re.MULTILINE
+)
+# The weather is read from the forecast page of Khimosi, so the tag needs no
+# argument: [WEATHER]. The name of the place may follow it, but only Khimosi
+# is on that page, so another place is refused and left to [SEARCH: ...].
+WEATHER_TAG_RE: re.Pattern[str] = re.compile(
+    r"^[ \t]*\[WEATHER(?::\s*(.*?))?\][ \t]*$", re.MULTILINE
+)
 # An image is not read as text: it is attached to the request, so the model can
 # look at it.
 IMAGE_RE: re.Pattern[str] = re.compile(
@@ -120,12 +148,19 @@ ANSWER_FROM_RESULT: str = "Answer from this result, do not write a tool tag."
 SYSTEM_PROMPT: str = """You are a helpful assistant with access to the internet
 and to the files of the directory the agent was started in.
 1st check your internal knowledge for general questions.
-2nd when you need real-time info: output exactly [SEARCH: query] on its own line.
-3rd when you need the content of a text file: output exactly [READ: path] on its own line.
-4th when you need to see an image: output exactly [IMAGE: path] on its own line.
-Search and file results will be provided in the next message as numbered title+snippet
-pairs, or as the file contents prefixed with line numbers, or as the image itself.
+2nd when you need the current date or time: output exactly [DATE] on its own line.
+3rd when you need the weather in Khimosi: output exactly [WEATHER] on its own line.
+4th when you need real-time info: output exactly [SEARCH: query] on its own line.
+5th when you need the content of a text file: output exactly [READ: path] on its own line.
+6th when you need to see an image: output exactly [IMAGE: path] on its own line.
+The time of another place is [DATE: IANA timezone], e.g. [DATE: Europe/Moscow].
+The weather comes from ru-meteo.ru, and only for Khimosi; for another place
+search the web instead. Search, date, weather and file results will be provided
+in the next message as numbered title+snippet pairs, as the current date and
+time, as the forecast, or as the file contents prefixed with line numbers, or
+as the image itself.
 Once a result is provided, answer from it — do not write another tag in the same turn.
+Never guess the date, time or weather: ask with [DATE] or [WEATHER] first.
 Paths are relative to the current directory; `~` is expanded.
 Extract ALL facts from all snippets — dates, numbers, names, capabilities, features.
 For service/website descriptions: summarize what they offer.
@@ -140,7 +175,7 @@ MAX_SEARCH_RESULTS: int = 5  # max results to show per search
 OPEN_METEO_GEO: str = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_WX: str = "https://api.open-meteo.com/v1/forecast"
 
-WEATHER_RE: re.Pattern[str] = re.compile(
+WEATHER_WORDS_RE: re.Pattern[str] = re.compile(
     r"\b(weather|temperature|forecast|rain|snow|wind|humid|cloud|sunny|storm)\b",
     re.IGNORECASE,
 )
@@ -204,7 +239,7 @@ SPEAK_DEFAULT: bool = True  # spoken replies are on unless muted with /s
 # One Piper voice per language, picked automatically from the reply's script.
 # Any name from `python -m piper.download_voices` works.
 PIPER_VOICE_EN: str = "en_US-lessac-medium"
-PIPER_VOICE_RU: str = "ru_RU-denis-medium"
+PIPER_VOICE_RU: str = "ru_RU-irina-medium"
 PIPER_USE_CUDA: bool = False  # "cuda" needs onnxruntime-gpu, keep False on CPU
 TTS_DIR: str = str(Path.home() / ".local" / "share" / "ai-python-agent" / "voices")
 TTS_MAX_CHARS: int = 1200  # speak at most this much of a long reply, ~1 minute
@@ -222,6 +257,260 @@ LATIN_RE: re.Pattern[str] = re.compile(r"[A-Za-z]")
 # Voice and the word spoken in place of a URL, per detected language.
 TTS_VOICES: dict[str, str] = {"en": PIPER_VOICE_EN, "ru": PIPER_VOICE_RU}
 TTS_LINK_WORDS: dict[str, str] = {"en": "link", "ru": "ссылка"}
+
+
+WEEKDAY_NAMES: tuple[str, ...] = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+MONTH_NAMES: tuple[str, ...] = (
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+
+
+def current_datetime(argument: str = "") -> str:
+    """Tell the model the current date and time.
+
+    The time is taken from the computer the agent runs on, so the model does
+    not have to guess today's date or the hour. The names of the weekdays and
+    the months are spelled out in English whatever the locale, so the model
+    always gets the same words to answer with.
+
+    Args:
+        argument: an optional IANA timezone name such as "Europe/Moscow";
+                  empty or blank means the local time of this computer.
+
+    Returns:
+        The date, the time, the timezone and the ISO 8601 form of the moment,
+        or a message explaining that the timezone is not known.
+    """
+    zone = argument.strip()
+    try:
+        if zone:
+            now = datetime.now(ZoneInfo(zone))
+        else:
+            now = datetime.now().astimezone()
+    except (ZoneInfoNotFoundError, ValueError):
+        return (
+            f"Cannot tell the time in {zone}: no such timezone,"
+            f" use an IANA name such as Europe/Moscow"
+        )
+    offset = now.strftime("%z")
+    offset = f"UTC{offset[:3]}:{offset[3:]}" if offset else "UTC"
+    abbr = f" {now.tzname()}" if now.tzname() else ""
+    stamp = (
+        f"{WEEKDAY_NAMES[now.weekday()]}, {now.day:02d} "
+        f"{MONTH_NAMES[now.month - 1]} {now.year}, "
+        f"{now:%H:%M:%S}{abbr} ({offset})"
+    )
+    return (
+        f"Current date and time: {stamp}\n"
+        f"ISO 8601: {now.isoformat(timespec='seconds')}\n"
+        f"Timezone: {zone or 'local time'}"
+    )
+
+
+HTML_TAG_RE: re.Pattern[str] = re.compile(r"<[^>]+>")
+
+
+def _plain_html(fragment: str) -> str:
+    """Turn an HTML fragment into one line of text.
+
+    Args:
+        fragment: the HTML to read, tags and all.
+
+    Returns:
+        The text of the fragment, with the tags and the extra spaces gone and
+        the entities decoded, so "&minus;1&deg;" comes out as "−1°".
+    """
+    text = html.unescape(HTML_TAG_RE.sub(" ", fragment))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_weather(page: str) -> str:
+    """Read the forecast out of the ru-meteo.ru page of Khimosi.
+
+    The page puts the current conditions in a `last-report` block and the
+    forecast for the coming days in a table, one cell per day. Both are read
+    as they are, in Russian, so the model can quote them; the labels are
+    English, as the rest of the tool results. A page that has neither is not
+    understood, rather than reported as good weather.
+
+    Args:
+        page: the HTML of the forecast page.
+
+    Returns:
+        The forecast as a few lines of text, or an empty string when nothing
+        on the page could be read.
+    """
+    lines: list[str] = []
+    current = re.search(
+        r'<div class="last-report">(.*?)<div class="clear">', page, re.DOTALL
+    )
+    if current:
+        block = current.group(1)
+        temp = re.search(
+            r'<div class="current-temp">\s*<span[^>]*>([^<]+)</span>', block
+        )
+        condition = re.search(r'<li class="condition-descr">([^<]*)</li>', block)
+        feels = re.search(r'<span class="apparent">([^<]+)</span>', block)
+        now = ", ".join(
+            filter(
+                None,
+                (
+                    _plain_html(temp.group(1)) if temp else "",
+                    _plain_html(condition.group(1)) if condition else "",
+                ),
+            )
+        )
+        if now:
+            feels_like = (
+                _plain_html(feels.group(1)).removeprefix("Ощущается как ")
+                if feels
+                else ""
+            )
+            lines.append(
+                f"Now: {now}" + (f" (feels like {feels_like})" if feels_like else "")
+            )
+        # The wind, the pressure and the humidity are the list items of the
+        # block; their labels are Russian, their values are what is shown.
+        for item in re.findall(r"<li[^>]*>(.*?)</li>", block, re.DOTALL):
+            text = _plain_html(item)
+            for label, english in (
+                ("Ветер:", "Wind:"),
+                ("Давление:", "Pressure:"),
+                ("Влажность воздуха:", "Humidity:"),
+            ):
+                if text.startswith(label):
+                    lines.append(text.replace(label, english, 1))
+        # The time of day ("Днём", "Вечером", "Ночью") with its weather.
+        parts = [
+            " ".join(filter(None, (_plain_html(part) for part in found)))
+            for found in re.findall(
+                r'<span class="ext-time">([^<]*)</span>'
+                r'<span class="ext-cond">(.*?)</span>'
+                r'<span class="ext-text">([^<]*)</span>',
+                block,
+                re.DOTALL,
+            )
+        ]
+        if parts:
+            lines.append("Day parts: " + "; ".join(parts))
+        report = re.search(
+            r'<div class="report-time">\s*<p>(.*?)</p>', block, re.DOTALL
+        )
+        if report:
+            lines.append(f"Report: {_plain_html(report.group(1))}")
+
+    days: list[str] = []
+    forecast = re.search(r'<table id="forecast">(.*?)</table>', page, re.DOTALL)
+    for cell in (forecast.group(1).split("<td>") if forecast else []):
+        if 'class="dt' not in cell:
+            continue
+        date = re.search(
+            r'<div class="dt[^"]*">\s*<big[^>]*>([^<]*)</big>\s*([^<]*?)\s*</div>',
+            cell,
+        )
+        weather = re.search(
+            r'<div class="wtr[^"]*">.*?<big>([^<]+)</big>\s*<p>([^<]*)</p>',
+            cell,
+            re.DOTALL,
+        )
+        night = re.search(
+            r'<div class="nprt[^"]*">\s*Ночью:\s*'
+            r'<span class="n_tmp">([^<]+)</span>(.*?)</div>',
+            cell,
+            re.DOTALL,
+        )
+        details = re.search(r'<div class="inf[^"]*">(.*?)</div>', cell, re.DOTALL)
+        parts: list[str] = []
+        if date:
+            weekday = _plain_html(date.group(1))
+            day_month = _plain_html(date.group(2))
+            parts.append(f"{weekday}, {day_month}" if weekday else day_month)
+        if weather:
+            day_temperature = _plain_html(weather.group(1))
+            day_condition = _plain_html(weather.group(2))
+            parts.append(f"day {day_temperature} {day_condition}".strip())
+        if night:
+            text = f"night {_plain_html(night.group(1))}"
+            night_condition = re.search(
+                r'class="nPh"[^>]*title="([^"]*)"', night.group(2)
+            )
+            if night_condition:
+                text += f" ({_plain_html(night_condition.group(1))})"
+            parts.append(text)
+        if details:
+            bits = [
+                _plain_html(f"<p>{paragraph}</p>")
+                for paragraph in re.findall(
+                    r"<p[^>]*>(.*?)</p>", details.group(1), re.DOTALL
+                )
+            ]
+            bits = [bit for bit in bits if bit]
+            if bits:
+                parts.append(", ".join(bits))
+        if parts:
+            days.append("; ".join(parts))
+
+    if days:
+        lines.append("Forecast:")
+        lines.extend(f"  {day}" for day in days)
+    return "\n".join(lines)
+
+
+def weather_forecast(argument: str = "") -> str:
+    """Fetch the weather forecast of Khimosi from ru-meteo.ru.
+
+    The page the tool reads is the forecast of one place, so another place is
+    refused with a note to search for it instead, rather than answered with
+    the weather of Khimosi.
+
+    Args:
+        argument: the place the model named, if any; empty means Khimosi.
+
+    Returns:
+        The forecast as text, or a message explaining why it could not be
+        fetched or read.
+    """
+    place = argument.strip()
+    if place and place.casefold() not in WEATHER_PLACE_NAMES:
+        return (
+            f"The forecast is read only for {WEATHER_PLACE}, not for {place};"
+            f" use [SEARCH: weather {place}] for another place"
+        )
+    request = urllib.request.Request(
+        WEATHER_URL,
+        headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=WEATHER_TIMEOUT) as resp:
+            page = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError) as e:
+        return f"Cannot fetch the weather from {WEATHER_URL}: {e}"
+    forecast = parse_weather(page)
+    if not forecast:
+        return (
+            f"Cannot read the weather forecast from {WEATHER_URL}:"
+            f" the page is not understood"
+        )
+    return f"Weather forecast for {WEATHER_PLACE}, from {WEATHER_URL}:\n{forecast}"
 
 
 def _get_weather(location: str) -> str:
@@ -307,7 +596,7 @@ def search_web(query: str) -> str:
     Returns a formatted string with up to MAX_SEARCH_RESULTS (5) entries:
     each entry has a numbered title and a snippet.
 
-    If the query mentions weather (via WEATHER_RE), extracts the location string
+    If the query mentions weather (via WEATHER_WORDS_RE), extracts the location string
     from the query (stripping common prepositions and country names), then calls
     _get_weather() and prepends the weather info to the results.
 
@@ -344,8 +633,8 @@ def search_web(query: str) -> str:
 
     output = "Search results:\n" + "\n".join(results)
 
-    if WEATHER_RE.search(query):
-        location = re.sub(WEATHER_RE, "", query).strip()
+    if WEATHER_WORDS_RE.search(query):
+        location = re.sub(WEATHER_WORDS_RE, "", query).strip()
         location = re.sub(
             r"\b(in|at|for|today|now|tomorrow|yesterday|this|current|russia|usa|uk|canada|germany|france|china|japan|india|australia|brazil)\b",
             "",
@@ -568,6 +857,8 @@ def drop_stale_images(messages: list[dict[str, Any]]) -> None:
 TOOLS: dict[
     str, tuple[re.Pattern[str], Callable[[str], str | list[dict[str, Any]]]]
 ] = {
+    "DATE": (DATE_RE, current_datetime),
+    "WEATHER": (WEATHER_TAG_RE, weather_forecast),
     "SEARCH": (SEARCH_RE, search_web),
     "READ": (READ_RE, read_file),
     "IMAGE": (IMAGE_RE, read_image),
@@ -1299,10 +1590,11 @@ def agent_turn(
 ) -> str | None:
     """Answer the last user message, running the tools the model asks for.
 
-    A reply carrying a tool tag such as [SEARCH: query] or [READ: path] is not
-    shown as the answer: the tool runs, its result is appended to the history
-    and the model is asked again, up to MAX_TOOL_ROUNDS times. The reply that
-    carries no tag is the answer, and the history is trimmed afterwards.
+    A reply carrying a tool tag such as [SEARCH: query], [READ: path], [DATE]
+    or [WEATHER] is not shown as the answer: the tool runs, its result is
+    appended to the history and the model is asked again, up to
+    MAX_TOOL_ROUNDS times. The reply that carries no tag is the answer, and
+    the history is trimmed afterwards.
 
     Args:
         messages: the conversation history, extended in place.
@@ -1322,7 +1614,7 @@ def agent_turn(
     for _ in range(MAX_TOOL_ROUNDS):
         call = next(
             (
-                (name, tool, match.group(1))
+                (name, tool, match.group(1) or "")
                 for name, (pattern, tool) in TOOLS.items()
                 if (match := pattern.search(reply))
             ),
@@ -1331,7 +1623,8 @@ def agent_turn(
         if call is None:
             break
         name, tool, argument = call
-        print(f"[{name.lower()}] {argument}", flush=True)
+        called = f"[{name.lower()}]" + (f" {argument}" if argument else "")
+        print(called, flush=True)
         # A tool answers with text, or with content parts when it attaches an
         # image. Either way a reminder to answer follows, since a small model
         # tends to write another tag instead of answering.

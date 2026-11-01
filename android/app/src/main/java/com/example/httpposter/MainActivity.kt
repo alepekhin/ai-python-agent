@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
@@ -16,7 +17,8 @@ import kotlin.concurrent.thread
 /**
  * One screen: a server URL, a multiline box for arbitrary text, and the
  * response of the server below it. Text is typed or dictated with the
- * microphone, which is transcribed by the server.
+ * microphone, which is transcribed by the server. Replies are read out loud
+ * unless the Speak box is unchecked.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -25,6 +27,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var response: TextView
     private lateinit var sendButton: Button
     private lateinit var voiceButton: Button
+    private lateinit var speakCheck: CheckBox
+    private lateinit var speaker: Speaker
 
     private var timeoutSeconds: Int = ServerConfig.DEFAULT_TIMEOUT_SECONDS
     private var session: String? = null
@@ -38,6 +42,12 @@ class MainActivity : AppCompatActivity() {
         response = findViewById(R.id.response)
         sendButton = findViewById(R.id.sendButton)
         voiceButton = findViewById(R.id.voiceButton)
+        speakCheck = findViewById(R.id.speakCheck)
+
+        speaker = Speaker(this)
+        speakCheck.setOnCheckedChangeListener { _, checked ->
+            if (!checked) speaker.stop()
+        }
 
         val config = ServerConfig.load(this)
         serverUrl.setText(config.url)
@@ -58,6 +68,7 @@ class MainActivity : AppCompatActivity() {
         voiceButton.setOnClickListener { onVoiceClick() }
 
         findViewById<Button>(R.id.clearButton).setOnClickListener {
+            speaker.stop()
             prompt.text.clear()
             response.text = ""
             session = null
@@ -79,6 +90,7 @@ class MainActivity : AppCompatActivity() {
 
         hideKeyboard()
         prompt.clearFocus()
+        speaker.stop()
         sendButton.isEnabled = false
         response.text = getString(R.string.thinking)
 
@@ -91,6 +103,7 @@ class MainActivity : AppCompatActivity() {
                     response.text = result.reply
                     prompt.text.clear()
                     sendButton.isEnabled = true
+                    if (speakCheck.isChecked) speaker.speak(result.reply)
                 }
             } catch (e: Exception) {
                 runOnUiThread {
@@ -142,6 +155,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startRecording() {
+        speaker.stop()
         try {
             VoiceRecorder.start()
         } catch (e: Exception) {
@@ -193,6 +207,11 @@ class MainActivity : AppCompatActivity() {
             chatUrl.trimEnd('/')
         }
         return "$base/transcribe"
+    }
+
+    override fun onDestroy() {
+        speaker.shutdown()
+        super.onDestroy()
     }
 
     companion object {

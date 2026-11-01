@@ -8,6 +8,7 @@
     <string name="voice">Voice</string>
     <string name="stop">Stop</string>
     <string name="response_title">Response</string>
+    <string name="speak">Speak</string>
     <string name="thinking">Sending…</string>
     <string name="listening">Listening…</string>
     <string name="transcribing">Transcribing…</string>

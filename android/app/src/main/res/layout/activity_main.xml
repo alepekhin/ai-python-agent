@@ -72,12 +72,27 @@
             android:text="@string/voice" />
     </LinearLayout>
 
-    <TextView
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="12dp"
-        android:text="@string/response_title"
-        android:textStyle="bold" />
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/response_title"
+            android:textStyle="bold" />
+
+        <CheckBox
+            android:id="@+id/speakCheck"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="@string/speak" />
+    </LinearLayout>
 
     <ScrollView
         android:layout_width="match_parent"

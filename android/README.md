@@ -13,6 +13,9 @@ press **Clear**.
 The prompt can be typed or dictated: the **Voice** button records the
 microphone and sends the WAV to the server's `/transcribe` endpoint, and the
 returned transcript lands in the prompt box (edit it before sending if needed).
+Every reply is also read out loud by the Android text-to-speech engine, in
+Russian or English depending on the script of the reply; uncheck **Speak** to
+mute it.
 
 - One screen: a server URL, a multiline box for the text, and the response.
 - The server URL comes from the bundled `assets/server.json` and can be changed
@@ -29,6 +32,7 @@ app/src/main/
 │   ├── MainActivity.kt                   # UI: URL field, prompt, Send/Clear/Voice, response
 │   ├── ServerConfig.kt                   # loads server.json, saves the URL override
 │   ├── HttpPoster.kt                     # the POST request and the reply/session parsing
+│   ├── Speaker.kt                        # reads replies out loud with the TTS engine
 │   └── VoiceRecorder.kt                  # records the mic into a 16 kHz WAV
 ├── res/layout/activity_main.xml
 └── AndroidManifest.xml                   # INTERNET + RECORD_AUDIO, cleartext HTTP
@@ -188,4 +192,10 @@ host machine, so it works without any change.
   listen on `0.0.0.0` (not only `127.0.0.1`) for the phone to reach it.
 - HTTP is used on purpose (the local agent has no TLS); the app enables
   cleartext traffic for it.
+- Replies are spoken by the system text-to-speech engine (`android.speech.tts`),
+  so no extra package is needed; the voice is requested in Russian for a mostly
+  Cyrillic reply and in English otherwise. If a device has no engine or no
+  Russian voice data, the reply is spoken with the default voice, or not at
+  all — the text is always shown either way. Starting a new request, recording,
+  clearing the conversation, or unchecking **Speak** stops the audio.
 - `local.properties`, `.gradle/` and `build/` are not committed.

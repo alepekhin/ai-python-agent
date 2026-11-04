@@ -845,6 +845,48 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("outside", self._last_user_prompts()[-1])
         self.assertNotIn("top secret", output)
 
+    def test_file_command_sends_file_contents_as_the_prompt(self) -> None:
+        text = "Дать заключение по следующим данным\n\nГемоглобин 16.5\n"
+        (Path(self.tmpdir.name) / "kak.txt").write_text(text, encoding="utf-8")
+        output = self._run_agent(
+            [f"{agent.FILE_COMMAND} kak.txt", ""], responses=["REPLY"]
+        )
+        # The file reaches the model as the prompt itself, without line numbers.
+        self.assertEqual(self._last_user_prompts(), [text])
+        self.assertIn("Assistant: REPLY", output)
+
+    def test_file_command_reads_a_quoted_path_with_spaces(self) -> None:
+        text = "blood test\n"
+        name = "my results.txt"
+        (Path(self.tmpdir.name) / name).write_text(text, encoding="utf-8")
+        self._run_agent(
+            [f'{agent.FILE_COMMAND} "{name}"', ""], responses=["REPLY"]
+        )
+        self.assertEqual(self._last_user_prompts(), [text])
+
+    def test_file_command_without_a_path_shows_usage(self) -> None:
+        output = self._run_agent([agent.FILE_COMMAND, ""])
+        self.assertIn("Usage:", output)
+        self.assertEqual(FakeOllamaHandler.payloads, [])
+
+    def test_file_command_reports_a_binary_file(self) -> None:
+        (Path(self.tmpdir.name) / "blood.jpg").write_bytes(
+            b"\xff\xd8\xff\xe0JPEGBYTES\x00data"
+        )
+        output = self._run_agent([f"{agent.FILE_COMMAND} blood.jpg", ""])
+        self.assertIn("binary file", output)
+        self.assertNotIn("JPEGBYTES", output)
+        self.assertEqual(FakeOllamaHandler.payloads, [])
+
+    def test_file_command_stays_inside_the_allowed_directories(self) -> None:
+        secret = Path(self.tmpdir.name).parent / "prompt-secret.txt"
+        secret.write_text("top secret\n", encoding="utf-8")
+        self.addCleanup(secret.unlink)
+        output = self._run_agent([f"{agent.FILE_COMMAND} {secret}", ""])
+        self.assertIn("outside", output)
+        self.assertNotIn("top secret", output)
+        self.assertEqual(FakeOllamaHandler.payloads, [])
+
     def test_search_and_read_can_follow_each_other(self) -> None:
         (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", encoding="utf-8")
         output = self._run_agent(

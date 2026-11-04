@@ -225,10 +225,13 @@ HELP_TEXT: str = """Commands:
   /q - quit (or empty prompt)
   /s - toggle voice output (on by default)
   /v - record voice prompt
+  /f <path> - send a file's contents as the prompt
   /e - next prompts English -> answer Russian
   /r - next prompts Russian -> answer English
   /? - show this help
 """
+
+FILE_COMMAND: str = "/f"  # send the contents of a file as the prompt
 
 VOICE_COMMAND: str = "/v"  # type the prompt instead of typing it
 VOICE_SAMPLE_RATE: int = 16000  # sample rate of the WAV sent to the model
@@ -800,6 +803,53 @@ def read_file(path: str) -> str:
     numbered = "\n".join(f"{i}: {line}" for i, line in enumerate(lines, 1))
     note = "\n... truncated, file is bigger than READ_MAX_BYTES" if truncated else ""
     return f"Contents of {path} ({len(lines)} lines):\n{numbered}{note}"
+
+
+def read_prompt_file(argument: str) -> str:
+    """Read the file named after FILE_COMMAND to use its contents as the prompt.
+
+    The path is resolved inside the READ_ROOTS directories (see
+    resolve_read_path), so the command cannot walk out of them. The content is
+    sent as written, without line numbers, so a report, a letter or a code
+    sample can be handed to the model as the prompt itself. A binary file or a
+    directory is reported and nothing is sent, and a file bigger than
+    READ_MAX_BYTES is sent truncated.
+
+    Args:
+        argument: everything typed after FILE_COMMAND: the path of the file.
+
+    Returns:
+        The file contents to send as the prompt, or an empty string when there
+        is nothing to send (the reason is printed).
+    """
+    path = argument.strip().strip("\"'")
+    if not path:
+        print(f"Usage: {FILE_COMMAND} <path> - send a file's contents as the prompt")
+        return ""
+    target, reason = resolve_read_path(path)
+    if target is None:
+        print(f"Cannot read {path}: {reason}")
+        return ""
+    if is_binary(target):
+        try:
+            size = target.stat().st_size
+        except OSError:
+            size = 0
+        print(f"Cannot use {path} as a prompt: it is a binary file of {size} bytes")
+        return ""
+    try:
+        with target.open("rb") as handle:
+            data = handle.read(READ_MAX_BYTES + 1)
+    except OSError as e:
+        print(f"Cannot read {path}: {e.strerror or e}")
+        return ""
+    text = data[:READ_MAX_BYTES].decode("utf-8", errors="replace")
+    if len(data) > READ_MAX_BYTES:
+        text += "\n... truncated, file is bigger than READ_MAX_BYTES"
+    if not text.strip():
+        print(f"Cannot use {path} as a prompt: it is empty")
+        return ""
+    return text
 
 
 def read_image(path: str) -> str | list[dict[str, Any]]:
@@ -1698,13 +1748,15 @@ def main() -> None:
     Up/Down arrows recall previously entered commands, including prompts from
     earlier sessions, when readline is available. Typing /v instead of a prompt
     records it from the microphone, has the model transcribe the recording and
-    sends the transcript as the prompt. Spoken replies are on from the start:
-    every answer is read out loud with Piper in addition to being printed, and
-    typing /s mutes and unmutes them. Typing /e sends TRANSLATE_PROMPT to the
-    model, which then answers the English prompts to follow in Russian; /r sends
-    TRANSLATE_PROMPT_RU, for Russian prompts answered in English. The answer
-    language is the last line of the system prompt, which the command rewrites,
-    so the translate prompt and the system prompt never name two languages.
+    sends the transcript as the prompt. Typing /f <path> sends the contents of
+    that file as the prompt, as if it had been typed. Spoken replies are on
+    from the start: every answer is read out loud with Piper in addition to
+    being printed, and typing /s mutes and unmutes them. Typing /e sends
+    TRANSLATE_PROMPT to the model, which then answers the English prompts to
+    follow in Russian; /r sends TRANSLATE_PROMPT_RU, for Russian prompts
+    answered in English. The answer language is the last line of the system
+    prompt, which the command rewrites, so the translate prompt and the system
+    prompt never name two languages.
 
     Args:
         None
@@ -1761,8 +1813,15 @@ def main() -> None:
                     print()
                 continue
 
+            # File prompt: replace the command with the contents of the file
+            # it names, so a whole report or letter can be sent at once
+            if stripped == FILE_COMMAND or stripped.startswith(FILE_COMMAND + " "):
+                line = read_prompt_file(stripped[len(FILE_COMMAND):])
+                if not line:
+                    continue
+
             # Voice prompt: replace the typed command with its transcription
-            if line.strip() == VOICE_COMMAND:
+            if stripped == VOICE_COMMAND:
                 line = voice_prompt()
                 if not line:
                     continue

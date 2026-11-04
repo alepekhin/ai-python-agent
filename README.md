@@ -26,6 +26,8 @@ Run the agent with the venv interpreter (`.venv/bin/python agent.py`); `run_debu
 
 Type your prompt and press Enter. The agent sends the full conversation history to the model, so it remembers earlier turns. End the dialog by pressing Enter on an empty prompt (or typing `/q`, or pressing Ctrl+C).
 
+Type `/f <path>` to send the contents of a file as the prompt, without pasting it: for example `/f kak.txt` sends what is in `kak.txt` as if it had been typed. The path is resolved inside the read roots (the working directory by default, the same `READ_ROOTS` the `READ` tool uses), a file bigger than `READ_MAX_BYTES` is sent truncated, and a binary file or a missing path is reported instead of sent.
+
 Type `/e` when you start writing prompts in English: the agent sends `translate next prompts from English to Russian` (`TRANSLATE_PROMPT`) instead of the command itself, so the model translates the prompts to follow and keeps answering in Russian. Type `/r` for the other way round (`TRANSLATE_PROMPT_RU`, `translate next prompts from Russian to English`): Russian prompts are answered in English. The language of the answers is one line of the system prompt (`ANSWER_IN`, Russian by default, `DEFAULT_REPLY_LANGUAGE`), which the command rewrites, so the model is never told two languages at once.
 
 Press Up/Down to walk through the commands you already entered and repeat one (standard readline editing, so Ctrl+A/E/K and other shortcuts work too). The command history is saved to `~/.local/share/ai-python-agent/history` when the agent exits, so prompts from previous sessions are also available with the Up arrow; the last `HISTORY_LIMIT` (32) entries are kept. Set `HISTORY_FILE` in `agent.py` to store it elsewhere.

@@ -1,5 +1,7 @@
 package com.example.httpposter
 
+import android.util.Base64
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.net.HttpURLConnection
@@ -11,9 +13,10 @@ data class ChatResult(val reply: String, val session: String?)
 /**
  * Posts a prompt to the agent server over HTTP.
  *
- * Sends `{"prompt": ...}` as JSON to `/chat` and reads back
- * `{"reply": ..., "session": ...}`. When [session] is known it is sent in the
- * `X-Session-Id` header so the server keeps the conversation history.
+ * Sends `{"prompt": ...}` or multimodal `{"content": [...]}` as JSON to `/chat`
+ * and reads back `{"reply": ..., "session": ...}`. When [session] is known it
+ * is sent in the `X-Session-Id` header so the server keeps the conversation
+ * history.
  *
  * Blocking: call from a background thread.
  */
@@ -26,6 +29,39 @@ object HttpPoster {
         timeoutSeconds: Int
     ): ChatResult {
         val body = JSONObject().put("prompt", prompt).toString()
+        return postJson(url, body, session, timeoutSeconds)
+    }
+
+    /** Post a text prompt together with one image as chat content parts. */
+    fun postWithImage(
+        url: String,
+        prompt: String,
+        imageBytes: ByteArray,
+        mimeType: String,
+        session: String?,
+        timeoutSeconds: Int
+    ): ChatResult {
+        val encoded = Base64.encodeToString(imageBytes, Base64.NO_WRAP)
+        val parts = JSONArray()
+            .put(JSONObject().put("type", "text").put("text", prompt))
+            .put(
+                JSONObject()
+                    .put("type", "image_url")
+                    .put(
+                        "image_url",
+                        JSONObject().put("url", "data:$mimeType;base64,$encoded")
+                    )
+            )
+        val body = JSONObject().put("content", parts).toString()
+        return postJson(url, body, session, timeoutSeconds)
+    }
+
+    private fun postJson(
+        url: String,
+        body: String,
+        session: String?,
+        timeoutSeconds: Int
+    ): ChatResult {
         val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = timeoutSeconds * 1000

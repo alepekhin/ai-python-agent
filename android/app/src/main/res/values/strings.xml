@@ -7,6 +7,9 @@
     <string name="save">Save</string>
     <string name="voice">Voice</string>
     <string name="stop">Stop</string>
+    <string name="attach">Image</string>
+    <string name="remove_image">Remove image</string>
+    <string name="image_attached">Image attached</string>
     <string name="response_title">Response</string>
     <string name="speak">Speak</string>
     <string name="thinking">Sending…</string>

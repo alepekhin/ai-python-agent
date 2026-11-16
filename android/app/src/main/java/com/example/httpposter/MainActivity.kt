@@ -3,13 +3,18 @@ package com.example.httpposter
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Bundle
+import android.view.View
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import kotlin.concurrent.thread
@@ -17,8 +22,9 @@ import kotlin.concurrent.thread
 /**
  * One screen: a server URL, a multiline box for arbitrary text, and the
  * response of the server below it. Text is typed or dictated with the
- * microphone, which is transcribed by the server. Replies are read out loud
- * unless the Speak box is unchecked.
+ * microphone, which is transcribed by the server. An image can be attached
+ * and sent together with the prompt. Replies are read out loud unless the
+ * Speak box is unchecked.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -27,11 +33,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var response: TextView
     private lateinit var sendButton: Button
     private lateinit var voiceButton: Button
+    private lateinit var attachButton: Button
+    private lateinit var removeImageButton: Button
+    private lateinit var imagePreview: ImageView
+    private lateinit var imageStatus: TextView
     private lateinit var speakCheck: CheckBox
     private lateinit var speaker: Speaker
 
     private var timeoutSeconds: Int = ServerConfig.DEFAULT_TIMEOUT_SECONDS
     private var session: String? = null
+    private var selectedImageBytes: ByteArray? = null
+    private var selectedImageMime: String? = null
+
+    private val pickImage = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            loadSelectedImage(uri)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -42,6 +60,10 @@ class MainActivity : AppCompatActivity() {
         response = findViewById(R.id.response)
         sendButton = findViewById(R.id.sendButton)
         voiceButton = findViewById(R.id.voiceButton)
+        attachButton = findViewById(R.id.attachButton)
+        removeImageButton = findViewById(R.id.removeImageButton)
+        imagePreview = findViewById(R.id.imagePreview)
+        imageStatus = findViewById(R.id.imageStatus)
         speakCheck = findViewById(R.id.speakCheck)
 
         speaker = Speaker(this)
@@ -64,27 +86,31 @@ class MainActivity : AppCompatActivity() {
         }
 
         sendButton.setOnClickListener { send() }
-
         voiceButton.setOnClickListener { onVoiceClick() }
+        attachButton.setOnClickListener { pickImage.launch("image/*") }
+        removeImageButton.setOnClickListener { clearSelectedImage() }
 
         findViewById<Button>(R.id.clearButton).setOnClickListener {
             speaker.stop()
             prompt.text.clear()
             response.text = ""
             session = null
+            clearSelectedImage()
         }
     }
 
     private fun send() {
         val url = serverUrl.text.toString().trim()
         val text = prompt.text.toString().trim()
+        val imageBytes = selectedImageBytes
+        val imageMime = selectedImageMime
 
         if (url.isEmpty()) {
             toast("Enter a server URL")
             return
         }
-        if (text.isEmpty()) {
-            toast("Type something to send")
+        if (text.isEmpty() && imageBytes == null) {
+            toast("Type something or attach an image")
             return
         }
 
@@ -96,12 +122,17 @@ class MainActivity : AppCompatActivity() {
 
         thread {
             try {
-                val result = HttpPoster.post(url, text, session, timeoutSeconds)
+                val result = if (imageBytes != null && imageMime != null) {
+                    HttpPoster.postWithImage(url, text, imageBytes, imageMime, session, timeoutSeconds)
+                } else {
+                    HttpPoster.post(url, text, session, timeoutSeconds)
+                }
                 session = result.session
                 runOnUiThread {
                     hideKeyboard()
                     response.text = result.reply
                     prompt.text.clear()
+                    clearSelectedImage()
                     sendButton.isEnabled = true
                     if (speakCheck.isChecked) speaker.speak(result.reply)
                 }
@@ -207,6 +238,35 @@ class MainActivity : AppCompatActivity() {
             chatUrl.trimEnd('/')
         }
         return "$base/transcribe"
+    }
+
+    private fun loadSelectedImage(uri: Uri) {
+        try {
+            val mime = contentResolver.getType(uri) ?: "image/jpeg"
+            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: throw IllegalArgumentException("Cannot read the selected image")
+            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                ?: throw IllegalArgumentException("Unsupported image format")
+            selectedImageBytes = bytes
+            selectedImageMime = mime
+            imagePreview.setImageBitmap(bitmap)
+            imagePreview.visibility = View.VISIBLE
+            imageStatus.text = getString(R.string.image_attached)
+            imageStatus.visibility = View.VISIBLE
+            removeImageButton.visibility = View.VISIBLE
+        } catch (e: Exception) {
+            clearSelectedImage()
+            toast("Cannot attach image: ${e.message ?: e.javaClass.simpleName}")
+        }
+    }
+
+    private fun clearSelectedImage() {
+        selectedImageBytes = null
+        selectedImageMime = null
+        imagePreview.setImageDrawable(null)
+        imagePreview.visibility = View.GONE
+        imageStatus.visibility = View.GONE
+        removeImageButton.visibility = View.GONE
     }
 
     override fun onDestroy() {

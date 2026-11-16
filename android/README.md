@@ -1,11 +1,13 @@
 # HTTP Poster (Android)
 
 A small Android client for the [AI agent](../README.md) web server. It sends
-arbitrary text as an HTTP POST and shows the reply, so the agent can be used
-from a phone instead of the terminal.
+arbitrary text and optional images as an HTTP POST and shows the reply, so the
+agent can be used from a phone instead of the terminal.
 
 The app posts `{"prompt": "..."}` as JSON to the server's `/chat` endpoint and
-reads back `{"reply": "...", "session": "..."}`. The returned session id is
+reads back `{"reply": "...", "session": "..."}`. When an image is attached it
+posts `{"content": [...]}` with a text part and an `image_url` part, so the
+model can look at the picture and answer about it. The returned session id is
 sent back on the next request in the `X-Session-Id` header, so the server keeps
 the conversation history — every message continues the same dialogue until you
 press **Clear**.
@@ -17,7 +19,8 @@ Every reply is also read out loud by the Android text-to-speech engine, in
 Russian or English depending on the script of the reply; uncheck **Speak** to
 mute it.
 
-- One screen: a server URL, a multiline box for the text, and the response.
+- One screen: a server URL, a multiline box for the text, image attach/remove,
+  and the response.
 - The server URL comes from the bundled `assets/server.json` and can be changed
   in the app (saved, and used from then on).
 - Plain HTTP (cleartext) is enabled, since the agent serves over `http://`.
@@ -160,10 +163,10 @@ export PATH=$ANDROID_SDK_ROOT/platform-tools:$PATH
    ```
 
 5. In the app, set the server URL to the PC's LAN address, press **Save**, type
-   (or dictate with **Voice**) a message and press **Send**. The reply appears
-   below; errors (server down, timeout, bad URL) are shown in the response
-   area. The first time **Voice** is used, the app asks for the microphone
-   permission.
+   (or dictate with **Voice**) a message, optionally attach a picture with
+   **Image**, and press **Send**. The reply appears below; errors (server down,
+   timeout, bad URL) are shown in the response area. The first time **Voice** is
+   used, the app asks for the microphone permission.
 
 ### Run in an emulator (terminal)
 

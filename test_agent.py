@@ -887,6 +887,51 @@ class AgentTTYTest(unittest.TestCase):
         self.assertNotIn("top secret", output)
         self.assertEqual(FakeOllamaHandler.payloads, [])
 
+    def test_file_command_can_be_embedded_in_the_prompt(self) -> None:
+        text = "Гемоглобин 16.5"
+        (Path(self.tmpdir.name) / "kak.txt").write_text(text, encoding="utf-8")
+        self._run_agent(
+            [f"Translate each line: {agent.FILE_COMMAND} kak.txt", ""],
+            responses=["REPLY"],
+        )
+        # The file is inserted where /f is typed, not sent as the prompt.
+        self.assertEqual(
+            self._last_user_prompts(), [f"Translate each line: {text}"]
+        )
+
+    def test_several_file_commands_are_all_inserted(self) -> None:
+        (Path(self.tmpdir.name) / "a.txt").write_text("alpha", encoding="utf-8")
+        (Path(self.tmpdir.name) / "b.txt").write_text("beta", encoding="utf-8")
+        self._run_agent(
+            [
+                f"Compare {agent.FILE_COMMAND} a.txt with "
+                f"{agent.FILE_COMMAND} b.txt",
+                "",
+            ],
+            responses=["REPLY"],
+        )
+        self.assertEqual(self._last_user_prompts(), ["Compare alpha with beta"])
+
+    def test_file_command_reads_a_quoted_path_inside_a_prompt(self) -> None:
+        name = "my results.txt"
+        (Path(self.tmpdir.name) / name).write_text("blood test", encoding="utf-8")
+        self._run_agent(
+            [f'Summarize {agent.FILE_COMMAND} "{name}" briefly', ""],
+            responses=["REPLY"],
+        )
+        self.assertEqual(self._last_user_prompts(), ["Summarize blood test briefly"])
+
+    def test_embedded_file_command_aborts_when_the_file_cannot_be_read(self) -> None:
+        (Path(self.tmpdir.name) / "blood.jpg").write_bytes(
+            b"\xff\xd8\xff\xe0JPEGBYTES\x00data"
+        )
+        output = self._run_agent(
+            [f"Describe {agent.FILE_COMMAND} blood.jpg for me", ""]
+        )
+        self.assertIn("binary file", output)
+        self.assertNotIn("JPEGBYTES", output)
+        self.assertEqual(FakeOllamaHandler.payloads, [])
+
     def test_search_and_read_can_follow_each_other(self) -> None:
         (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", encoding="utf-8")
         output = self._run_agent(

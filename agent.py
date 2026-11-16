@@ -225,13 +225,19 @@ HELP_TEXT: str = """Commands:
   /q - quit (or empty prompt)
   /s - toggle voice output (on by default)
   /v - record voice prompt
-  /f <path> - send a file's contents as the prompt
+  /f <path> - insert a file's contents into the prompt
   /e - next prompts English -> answer Russian
   /r - next prompts Russian -> answer English
   /? - show this help
 """
 
-FILE_COMMAND: str = "/f"  # send the contents of a file as the prompt
+# The contents of the file named after FILE_COMMAND are put in the prompt in
+# place of the command, so the file can be the whole prompt or just a part of it.
+FILE_COMMAND: str = "/f"
+# FILE_COMMAND typed as a word of its own, anywhere in the prompt.
+FILE_COMMAND_RE: re.Pattern[str] = re.compile(
+    rf"(?<!\S){re.escape(FILE_COMMAND)}(?=\s|$)"
+)
 
 VOICE_COMMAND: str = "/v"  # type the prompt instead of typing it
 VOICE_SAMPLE_RATE: int = 16000  # sample rate of the WAV sent to the model
@@ -816,7 +822,8 @@ def read_prompt_file(argument: str) -> str:
     READ_MAX_BYTES is sent truncated.
 
     Args:
-        argument: everything typed after FILE_COMMAND: the path of the file.
+        argument: the path of the file, taken out of the prompt (see
+            take_file_path).
 
     Returns:
         The file contents to send as the prompt, or an empty string when there
@@ -824,7 +831,9 @@ def read_prompt_file(argument: str) -> str:
     """
     path = argument.strip().strip("\"'")
     if not path:
-        print(f"Usage: {FILE_COMMAND} <path> - send a file's contents as the prompt")
+        print(
+            f"Usage: {FILE_COMMAND} <path> - insert a file's contents into the prompt"
+        )
         return ""
     target, reason = resolve_read_path(path)
     if target is None:
@@ -850,6 +859,68 @@ def read_prompt_file(argument: str) -> str:
         print(f"Cannot use {path} as a prompt: it is empty")
         return ""
     return text
+
+
+def take_file_path(rest: str) -> tuple[str, str]:
+    """Take the path typed after FILE_COMMAND off the rest of the prompt.
+
+    A path wrapped in quotes may contain spaces, and the prompt goes on after
+    the closing quote ('Compare /f "my results.txt" with this'). Without
+    quotes the path ends at the first whitespace.
+
+    Args:
+        rest: the prompt right after FILE_COMMAND.
+
+    Returns:
+        The path and the rest of the prompt after it. The path is empty when
+        the command has no argument.
+    """
+    rest = rest.lstrip()
+    if not rest:
+        return "", ""
+    quote = rest[0]
+    if quote in "\"'":
+        end = rest.find(quote, 1)
+        if end != -1:
+            return rest[1:end], rest[end + 1 :]
+        return rest[1:], ""
+    path = rest.split(None, 1)[0]
+    return path, rest[len(path) :]
+
+
+def expand_file_commands(line: str) -> str:
+    """Replace every FILE_COMMAND in a prompt with the contents of its file.
+
+    FILE_COMMAND may be typed anywhere in the prompt, not only at the start:
+    `/f report.txt` alone sends the file as the prompt, while
+    `Summarize /f report.txt in one line` sends the question with the report
+    inside it, and `Compare /f a.txt with /f b.txt` sends both files. A file
+    that cannot be read (outside READ_ROOTS, binary, empty, ...) stops the
+    whole prompt from being sent, exactly as when the command is typed alone;
+    the reason is printed.
+
+    Args:
+        line: the prompt as typed, with zero or more file commands in it.
+
+    Returns:
+        The prompt with every file command replaced by its file's contents, or
+        an empty string when a file cannot be read or a path is missing (the
+        reason is printed).
+    """
+    parts: list[str] = []
+    rest = line
+    while True:
+        match = FILE_COMMAND_RE.search(rest)
+        if match is None:
+            parts.append(rest)
+            break
+        parts.append(rest[: match.start()])
+        path, rest = take_file_path(rest[match.end() :])
+        contents = read_prompt_file(path)
+        if not contents:
+            return ""
+        parts.append(contents)
+    return "".join(parts)
 
 
 def read_image(path: str) -> str | list[dict[str, Any]]:
@@ -1748,8 +1819,9 @@ def main() -> None:
     Up/Down arrows recall previously entered commands, including prompts from
     earlier sessions, when readline is available. Typing /v instead of a prompt
     records it from the microphone, has the model transcribe the recording and
-    sends the transcript as the prompt. Typing /f <path> sends the contents of
-    that file as the prompt, as if it had been typed. Spoken replies are on
+    sends the transcript as the prompt. Typing /f <path> puts the contents of
+    that file into the prompt where the command is, so the file can be the
+    whole prompt or a part of it. Spoken replies are on
     from the start: every answer is read out loud with Piper in addition to
     being printed, and typing /s mutes and unmutes them. Typing /e sends
     TRANSLATE_PROMPT to the model, which then answers the English prompts to
@@ -1813,10 +1885,11 @@ def main() -> None:
                     print()
                 continue
 
-            # File prompt: replace the command with the contents of the file
-            # it names, so a whole report or letter can be sent at once
-            if stripped == FILE_COMMAND or stripped.startswith(FILE_COMMAND + " "):
-                line = read_prompt_file(stripped[len(FILE_COMMAND):])
+            # File prompts: put the contents of every file named after /f into
+            # the prompt, so a whole report can be sent, or a question can be
+            # asked about it, or several files can be compared at once
+            if FILE_COMMAND_RE.search(line):
+                line = expand_file_commands(line)
                 if not line:
                     continue
 

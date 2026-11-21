@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import base64
 import contextlib
 import http.server
@@ -17,8 +19,15 @@ import unittest
 import urllib.error
 import urllib.request
 import wave
+from collections.abc import Generator, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import ClassVar, TypedDict, cast, override
+
+try:  # POSIX-only, as in the agent
+    import readline
+except ImportError:
+    readline = None  # type: ignore[assignment]
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -65,29 +74,77 @@ FAKE_METEO_HTML = """\
 """
 
 
+class FakePayload(TypedDict):
+    """The parts of a chat request the fake model and the tests look at."""
+
+    model: str
+    messages: list[agent.Message]
+    reasoning_effort: str
+
+
+class HttpResponse(typing.Protocol):
+    """The part of an URL response the tests read."""
+
+    status: int
+    headers: Mapping[str, str]
+
+    def read(self) -> bytes: ...
+    def __enter__(self) -> HttpResponse: ...
+    def __exit__(self, *exc: object) -> object: ...
+
+
+class VoiceCalls(TypedDict):
+    """What the fake voice modules record for a test to inspect."""
+
+    downloaded: list[tuple[str, str]]
+    loaded: list[tuple[str, str]]
+    spoken: list[tuple[str, str]]
+    played: list[tuple[int, int]]
+
+
+def decode_json(raw: str | bytes) -> agent.JsonObject:
+    """Decode a JSON response, narrowing the result at the boundary."""
+    text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    return cast("agent.JsonObject", cast(object, json.loads(text)))
+
+
+def error_text(payload: agent.JsonObject) -> str:
+    """Read the error string of a failed HTTP answer."""
+    return cast(str, payload["error"])
+
+
+def json_array(value: object) -> list[agent.JsonObject]:
+    """Read a JSON array of objects, failing on anything else."""
+    if not isinstance(value, list):
+        raise KeyError("expected a JSON array")
+    return [
+        cast("agent.JsonObject", item) for item in cast("list[object]", value)
+    ]
+
+
 class FakeOllamaHandler(http.server.BaseHTTPRequestHandler):
-    responses: typing.ClassVar[list[str]] = ["REPLY"]
-    payloads: typing.ClassVar[list[dict[str, typing.Any]]] = []
+    replies: ClassVar[list[str]] = ["REPLY"]
+    payloads: ClassVar[list[FakePayload]] = []
     # When set, a request carrying an audio block is rejected with this reason.
-    audio_error: typing.ClassVar[str | None] = None
+    audio_error: ClassVar[str | None] = None
 
     def do_POST(self) -> None:
         content_length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(content_length)
-        payload = json.loads(raw.decode("utf-8"))
+        payload = cast("FakePayload", cast(object, json.loads(raw.decode("utf-8"))))
         FakeOllamaHandler.payloads.append(payload)
         if self.audio_error and self._has_audio(payload):
             self._send(500, json.dumps({"error": self.audio_error}).encode("utf-8"))
             return
         body = json.dumps(
-            {"choices": [{"message": {"content": self.responses[0]}}]}
+            {"choices": [{"message": {"content": self.replies[0]}}]}
         ).encode("utf-8")
-        if len(self.responses) > 1:
-            self.responses.pop(0)
+        if len(self.replies) > 1:
+            _ = self.replies.pop(0)
         self._send(200, body)
 
     @staticmethod
-    def _has_audio(payload: dict[str, typing.Any]) -> bool:
+    def _has_audio(payload: FakePayload) -> bool:
         return any(
             isinstance(message["content"], list)
             and any(part["type"] == "input_audio" for part in message["content"])
@@ -99,24 +156,26 @@ class FakeOllamaHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        _ = self.wfile.write(body)
 
-    def log_message(self, *args: object) -> None:
+    @override
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
 class FakeDDGHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", 0))
-        self.rfile.read(length)
+        _ = self.rfile.read(length)
         body = FAKE_DDG_HTML.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        _ = self.wfile.write(body)
 
-    def log_message(self, *args: object) -> None:
+    @override
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
@@ -129,20 +188,25 @@ class FakeMeteoHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        _ = self.wfile.write(body)
 
-    def log_message(self, *args: object) -> None:
+    @override
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
 class BrokenModule(types.ModuleType):
     """Module that raises ImportError on any attribute access, as if missing."""
 
-    def __getattr__(self, name: str) -> typing.Any:
+    @override
+    def __getattr__(self, name: str) -> object:
         raise ImportError(f"No module named {self.__name__!r}")
 
 
 class FakePiperChunk:
+    sample_rate: int
+    audio_float_array: agent.AudioSamples
+
     def __init__(self, sample_rate: int = 22050) -> None:
         import numpy as np
 
@@ -157,7 +221,7 @@ def fake_voice_modules(
     tts_error: bool = False,
     levels: list[float] | None = None,
     interrupt_wait: bool = False,
-) -> typing.Iterator[dict[str, typing.Any]]:
+) -> Generator[VoiceCalls, None, None]:
     """Install fake sounddevice/piper modules for the duration.
 
     Args:
@@ -175,7 +239,7 @@ def fake_voice_modules(
     """
     import numpy as np
 
-    calls: dict[str, typing.Any] = {
+    calls: VoiceCalls = {
         "downloaded": [],
         "loaded": [],
         "spoken": [],
@@ -186,20 +250,26 @@ def fake_voice_modules(
         pass
 
     class RawInputStream:
-        def __init__(self, **kwargs: typing.Any) -> None:
+        kwargs: dict[str, object]
+
+        def __init__(self, **kwargs: object) -> None:
             self.kwargs = kwargs
 
-        def __enter__(self) -> typing.Self:
+        def __enter__(self) -> RawInputStream:
             if mic_error:
                 raise PortAudioError("no default input device")
-            blocksize = self.kwargs["blocksize"]
+            blocksize = cast(int, self.kwargs["blocksize"])
+            callback = cast(
+                "typing.Callable[[agent.AudioSamples, int, object, object], object]",
+                self.kwargs["callback"],
+            )
             spoken = (
                 [0.05] * agent.VOICE_NOISE_BLOCKS + [0.2, 0.2]
                 if levels is None
                 else levels
             )
             for level in spoken:
-                self.kwargs["callback"](
+                _ = callback(
                     np.full((blocksize, 1), level, dtype="float32"),
                     blocksize,
                     None,
@@ -210,7 +280,7 @@ def fake_voice_modules(
         def __exit__(self, *exc: object) -> bool:
             return False
 
-    def play(data: typing.Any, samplerate: typing.Any) -> None:
+    def play(data: agent.AudioSamples, samplerate: int) -> None:
         calls["played"].append((len(data), samplerate))
 
     def wait() -> None:
@@ -221,38 +291,40 @@ def fake_voice_modules(
         pass
 
     class PiperVoice:
+        name: str
+
         def __init__(self, name: str) -> None:
             self.name = name
 
         @staticmethod
         def load(
-            model_path: typing.Any, config_path: typing.Any = None, **kwargs: typing.Any
-        ) -> typing.Self:
+            model_path: object, config_path: object = None, **_kwargs: object
+        ) -> PiperVoice:
             if tts_error:
                 raise RuntimeError("broken onnx model")
             calls["loaded"].append((str(model_path), str(config_path)))
             return PiperVoice(Path(str(model_path)).stem)
 
-        def synthesize(self, text: str) -> list[typing.Any]:
+        def synthesize(self, text: str) -> list[FakePiperChunk]:
             calls["spoken"].append((self.name, text))
             return [FakePiperChunk()]
 
-    def download_voice(voice: str, download_dir: typing.Any) -> None:
+    def download_voice(voice: str, download_dir: str | Path) -> None:
         calls["downloaded"].append((voice, str(download_dir)))
-        (Path(download_dir) / f"{voice}.onnx").write_bytes(b"")
-        (Path(download_dir) / f"{voice}.onnx.json").write_text("{}")
+        _ = (Path(download_dir) / f"{voice}.onnx").write_bytes(b"")
+        _ = (Path(download_dir) / f"{voice}.onnx.json").write_text("{}")
 
     sounddevice = types.ModuleType("sounddevice")
-    sounddevice.RawInputStream = RawInputStream  # type: ignore[attr-defined]
-    sounddevice.PortAudioError = PortAudioError  # type: ignore[attr-defined]
-    sounddevice.play = play  # type: ignore[attr-defined]
-    sounddevice.wait = wait  # type: ignore[attr-defined]
-    sounddevice.stop = stop  # type: ignore[attr-defined]
+    setattr(sounddevice, "RawInputStream", RawInputStream)
+    setattr(sounddevice, "PortAudioError", PortAudioError)
+    setattr(sounddevice, "play", play)
+    setattr(sounddevice, "wait", wait)
+    setattr(sounddevice, "stop", stop)
     download_voices = types.ModuleType("piper.download_voices")
-    download_voices.download_voice = download_voice  # type: ignore[attr-defined]
+    setattr(download_voices, "download_voice", download_voice)
     piper = types.ModuleType("piper")
-    piper.PiperVoice = PiperVoice  # type: ignore[attr-defined]
-    piper.download_voices = download_voices  # type: ignore[attr-defined]
+    setattr(piper, "PiperVoice", PiperVoice)
+    setattr(piper, "download_voices", download_voices)
 
     fakes = {
         "sounddevice": sounddevice,
@@ -278,16 +350,20 @@ def fake_voice_modules(
 class AgentServerTest(unittest.TestCase):
     """The web server mode: a prompt sent over HTTP comes back as a reply."""
 
-    ollama: http.server.HTTPServer
-    ddg: http.server.HTTPServer
-    web: http.server.ThreadingHTTPServer
+    ollama: ClassVar[http.server.HTTPServer]
+    ddg: ClassVar[http.server.HTTPServer]
+    web: ClassVar[http.server.ThreadingHTTPServer]
+    base: ClassVar[str]
+    tmpdir: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @classmethod
+    @override
     def setUpClass(cls) -> None:
         class QuietAgentHandler(agent.AgentHandler):
             """The agent's handler without the request log in the test output."""
 
-            def log_message(self, *args: object) -> None:
+            @override
+            def log_message(self, format: str, *args: object) -> None:
                 pass
 
         cls.ollama = http.server.HTTPServer(("127.0.0.1", 0), FakeOllamaHandler)
@@ -300,6 +376,7 @@ class AgentServerTest(unittest.TestCase):
         cls.base = f"http://127.0.0.1:{cls.web.server_address[1]}"
 
     @classmethod
+    @override
     def tearDownClass(cls) -> None:
         cls.web.shutdown()
         cls.web.server_close()
@@ -308,6 +385,7 @@ class AgentServerTest(unittest.TestCase):
         cls.ddg.shutdown()
         cls.ddg.server_close()
 
+    @override
     def setUp(self) -> None:
         # The saved prompt of every turn goes to a throwaway file, so the
         # real one in the user's home directory is never touched.
@@ -327,7 +405,7 @@ class AgentServerTest(unittest.TestCase):
         agent.DDG_URL = f"http://127.0.0.1:{self.ddg.server_address[1]}/html/"
         agent.READ_ROOTS = [self.tmpdir.name]
         self.addCleanup(setattr, agent, "READ_ROOTS", None)
-        FakeOllamaHandler.responses = ["REPLY"]
+        FakeOllamaHandler.replies = ["REPLY"]
         FakeOllamaHandler.payloads = []
         # Each test starts with no conversations of its own.
         agent.CONVERSATIONS.clear()
@@ -338,20 +416,22 @@ class AgentServerTest(unittest.TestCase):
     ) -> tuple[int, bytes, dict[str, str]]:
         """Send a request and return its status, body and headers."""
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with cast(
+                "HttpResponse", urllib.request.urlopen(request, timeout=20)
+            ) as response:
                 return response.status, response.read(), dict(response.headers)
         except urllib.error.HTTPError as e:
             status, payload, headers = e.code, e.read(), dict(e.headers)
-            e.close()
+            _ = e.close()
             return status, payload, headers
 
     def _post(
         self,
-        body: str | bytes | dict[str, typing.Any],
+        body: str | bytes | agent.JsonObject,
         path: str = "/chat",
         content_type: str = "application/json",
         headers: dict[str, str] | None = None,
-    ) -> tuple[int, dict[str, typing.Any]]:
+    ) -> tuple[int, agent.JsonObject]:
         """POST a body and return the status and the decoded JSON answer.
 
         A dict is sent as JSON, a str or bytes as it is.
@@ -369,13 +449,15 @@ class AgentServerTest(unittest.TestCase):
             method="POST",
         )
         status, payload, _ = self._open(request)
-        return status, json.loads(payload.decode("utf-8"))
+        return status, decode_json(payload)
 
-    def _get(self, path: str, json_body: bool = True) -> tuple[int, typing.Any]:
+    def _get(
+        self, path: str, json_body: bool = True
+    ) -> tuple[int, agent.JsonObject | str]:
         """GET a path and return the status and the body, decoded as asked."""
         status, payload, _ = self._open(urllib.request.Request(self.base + path))
         text = payload.decode("utf-8")
-        return status, (json.loads(text) if json_body else text)
+        return status, (decode_json(text) if json_body else text)
 
     @staticmethod
     def _sent_prompts() -> list[str]:
@@ -383,7 +465,7 @@ class AgentServerTest(unittest.TestCase):
         return [
             message["content"]
             for message in FakeOllamaHandler.payloads[-1]["messages"]
-            if message["role"] == "user"
+            if message["role"] == "user" and isinstance(message["content"], str)
         ]
 
     def test_prompt_comes_back_as_reply(self) -> None:
@@ -413,7 +495,7 @@ class AgentServerTest(unittest.TestCase):
         status, second = self._post(
             "second",
             content_type="text/plain",
-            headers={"X-Session-Id": first["session"]},
+            headers={"X-Session-Id": cast(str, first["session"])},
         )
         self.assertEqual(status, 200)
         self.assertEqual(second["session"], first["session"])
@@ -428,7 +510,7 @@ class AgentServerTest(unittest.TestCase):
     def test_two_requests_of_one_session_share_its_history(self) -> None:
         _, first = self._post({"prompt": "one"})
         session = first["session"]
-        answers: list[tuple[int, dict[str, typing.Any]]] = []
+        answers: list[tuple[int, agent.JsonObject]] = []
 
         def ask(prompt: str) -> None:
             answers.append(self._post({"prompt": prompt, "session": session}))
@@ -447,36 +529,36 @@ class AgentServerTest(unittest.TestCase):
         prompts = {
             message["content"]
             for message in FakeOllamaHandler.payloads[-1]["messages"]
-            if message["role"] == "user"
+            if message["role"] == "user" and isinstance(message["content"], str)
         }
         self.assertEqual(prompts, {"one", "first thread", "second thread"})
 
     def test_empty_prompt_is_refused(self) -> None:
         status, payload = self._post({"prompt": "   "})
         self.assertEqual(status, 400)
-        self.assertIn("empty", payload["error"])
+        self.assertIn("empty", error_text(payload))
         self.assertEqual(FakeOllamaHandler.payloads, [])
 
     def test_body_without_a_prompt_is_refused(self) -> None:
         status, payload = self._post({})
         self.assertEqual(status, 400)
-        self.assertIn("prompt", payload["error"])
+        self.assertIn("prompt", error_text(payload))
         self.assertEqual(FakeOllamaHandler.payloads, [])
 
     def test_invalid_json_is_refused(self) -> None:
         status, payload = self._post("{not json")
         self.assertEqual(status, 400)
-        self.assertIn("invalid JSON", payload["error"])
+        self.assertIn("invalid JSON", error_text(payload))
 
     def test_json_session_must_be_a_string(self) -> None:
         status, payload = self._post({"prompt": "hello", "session": 7})
         self.assertEqual(status, 400)
-        self.assertIn("session", payload["error"])
+        self.assertIn("session", error_text(payload))
 
     def test_body_without_content_is_refused(self) -> None:
         status, payload = self._post(b"", content_type="text/plain")
         self.assertEqual(status, 400)
-        self.assertIn("no body", payload["error"])
+        self.assertIn("no body", error_text(payload))
 
     def test_unknown_path_is_404(self) -> None:
         status, _ = self._post({"prompt": "hello"}, path="/nowhere")
@@ -512,7 +594,10 @@ class AgentServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload, {"text": "REPLY"})
         # The recording is sent to the model as an input_audio part.
-        sent = FakeOllamaHandler.payloads[-1]["messages"][-1]["content"]
+        sent = cast(
+            "list[agent.ContentPart]",
+            FakeOllamaHandler.payloads[-1]["messages"][-1]["content"],
+        )
         self.assertEqual(sent[1]["type"], "input_audio")
 
     def test_transcribe_refuses_a_body_that_is_not_a_wav(self) -> None:
@@ -520,17 +605,17 @@ class AgentServerTest(unittest.TestCase):
             b"not a wav", path="/transcribe", content_type="audio/wav"
         )
         self.assertEqual(status, 400)
-        self.assertIn("RIFF", payload["error"])
+        self.assertIn("RIFF", error_text(payload))
 
     def test_transcribe_refuses_the_wrong_sample_rate(self) -> None:
         status, payload = self._post(
             self._wav(rate=44_100), path="/transcribe", content_type="audio/wav"
         )
         self.assertEqual(status, 400)
-        self.assertIn("16000", payload["error"])
+        self.assertIn("16000", error_text(payload))
 
     def test_tool_reply_is_run_and_not_shown(self) -> None:
-        FakeOllamaHandler.responses = [
+        FakeOllamaHandler.replies = [
             "[SEARCH: python list comprehension]",
             "REPLY",
         ]
@@ -545,7 +630,7 @@ class AgentServerTest(unittest.TestCase):
         agent.OLLAMA_URL = "http://127.0.0.1:1/v1/chat/completions"
         status, payload = self._post({"prompt": "lost", "session": session})
         self.assertEqual(status, 502)
-        self.assertIn("cannot reach Ollama", payload["error"])
+        self.assertIn("cannot reach Ollama", error_text(payload))
 
         # The prompt that was not answered is not left behind in the history.
         agent.OLLAMA_URL = (
@@ -571,17 +656,19 @@ class AgentServerTest(unittest.TestCase):
 
 
 class AgentTTYTest(unittest.TestCase):
-    server: http.server.HTTPServer
-    ddg_server: http.server.HTTPServer
-    meteo_server: http.server.HTTPServer
-    thread: threading.Thread
-    ddg_thread: threading.Thread
-    meteo_thread: threading.Thread
-    port: int
-    ddg_port: int
-    meteo_port: int
+    server: ClassVar[http.server.HTTPServer]
+    ddg_server: ClassVar[http.server.HTTPServer]
+    meteo_server: ClassVar[http.server.HTTPServer]
+    thread: ClassVar[threading.Thread]
+    ddg_thread: ClassVar[threading.Thread]
+    meteo_thread: ClassVar[threading.Thread]
+    port: ClassVar[int]
+    ddg_port: ClassVar[int]
+    meteo_port: ClassVar[int]
+    tmpdir: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @classmethod
+    @override
     def setUpClass(cls) -> None:
         cls.server = http.server.HTTPServer(("127.0.0.1", 0), FakeOllamaHandler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -603,6 +690,7 @@ class AgentTTYTest(unittest.TestCase):
         cls.meteo_port = cls.meteo_server.server_address[1]
 
     @classmethod
+    @override
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
         cls.server.server_close()
@@ -611,6 +699,7 @@ class AgentTTYTest(unittest.TestCase):
         cls.meteo_server.shutdown()
         cls.meteo_server.server_close()
 
+    @override
     def setUp(self) -> None:
         # Point the persisted history and the voice cache at a throwaway
         # directory, so tests never read or write the real ones in the user's
@@ -636,15 +725,15 @@ class AgentTTYTest(unittest.TestCase):
         self.addCleanup(setattr, agent, "WEATHER_URL", weather_url)
         agent.load_piper.cache_clear()
         self.addCleanup(agent.load_piper.cache_clear)
-        if agent.readline is not None:
-            agent.readline.clear_history()
-            self.addCleanup(agent.readline.clear_history)
+        if readline is not None:
+            readline.clear_history()
+            self.addCleanup(readline.clear_history)
 
     def _run_agent(
         self,
         lines: list[str],
         responses: list[str] | None = None,
-        markers: list[bytes | None] | None = None,
+        markers: Sequence[bytes | None] | None = None,
     ) -> str:
         """Run the agent on a pty, feeding it `lines` one by one.
 
@@ -659,9 +748,9 @@ class AgentTTYTest(unittest.TestCase):
         saved_stdin: int = os.dup(0)
         saved_stdout: int = os.dup(1)
         saved_stderr: int = os.dup(2)
-        os.dup2(slave, 0)
-        os.dup2(slave, 1)
-        os.dup2(slave, 2)
+        _ = os.dup2(slave, 0)
+        _ = os.dup2(slave, 1)
+        _ = os.dup2(slave, 2)
         os.close(slave)
 
         old_url: str = agent.OLLAMA_URL
@@ -671,9 +760,13 @@ class AgentTTYTest(unittest.TestCase):
         agent.DDG_URL = f"http://127.0.0.1:{self.ddg_port}/html/"
         agent.MODEL = "test-model"
         if responses is not None:
-            FakeOllamaHandler.responses = list(responses)
+            FakeOllamaHandler.replies = list(responses)
         FakeOllamaHandler.payloads = []
-        sys.stdout.reconfigure(line_buffering=True)
+        reconfigure = cast(
+            "typing.Callable[..., object]",
+            cast(object, getattr(sys.stdout, "reconfigure")),
+        )
+        _ = reconfigure(line_buffering=True)
 
         output: bytes = b""
         searched: int = 0  # only look at output produced after the last match
@@ -705,19 +798,19 @@ class AgentTTYTest(unittest.TestCase):
                 if marker is not None:
                     wait_for(marker)
                 time.sleep(0.1)
-                os.write(master, (line + "\n").encode("utf-8"))
+                _ = os.write(master, (line + "\n").encode("utf-8"))
             wait_for(b"Bye!")
             t.join(timeout=5)
         finally:
             os.close(master)
-            os.dup2(saved_stdin, 0)
-            os.dup2(saved_stdout, 1)
-            os.dup2(saved_stderr, 2)
+            _ = os.dup2(saved_stdin, 0)
+            _ = os.dup2(saved_stdout, 1)
+            _ = os.dup2(saved_stderr, 2)
             os.close(saved_stdin)
             os.close(saved_stdout)
             os.close(saved_stderr)
             agent.OLLAMA_URL, agent.MODEL, agent.DDG_URL = old_url, old_model, old_ddg
-            FakeOllamaHandler.responses = ["REPLY"]
+            FakeOllamaHandler.replies = ["REPLY"]
         return output.decode("utf-8", "replace")
 
     def test_normal_conversation_then_empty_exit(self) -> None:
@@ -763,7 +856,7 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("Assistant: Here is what I found.", output)
 
     def test_read_triggered(self) -> None:
-        (Path(self.tmpdir.name) / "notes.txt").write_text("hello\nworld\n", "utf-8")
+        _ = (Path(self.tmpdir.name) / "notes.txt").write_text("hello\nworld\n", "utf-8")
         output = self._run_agent(
             ["what is in notes.txt?\n", "\n"],
             responses=["[READ: notes.txt]", "It says hello and world."],
@@ -800,7 +893,7 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_read_of_binary_file_gives_the_path_only(self) -> None:
         picture = Path(self.tmpdir.name) / "blood.jpg"
-        picture.write_bytes(b"\xff\xd8\xff\xe0JPEGBYTES\x00data")
+        _ = picture.write_bytes(b"\xff\xd8\xff\xe0JPEGBYTES\x00data")
         output = self._run_agent(
             ["what is in blood.jpg?\n", "\n"],
             responses=["[READ: blood.jpg]", "It is a photo, I cannot show it."],
@@ -815,8 +908,8 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_prompt_naming_a_binary_file_carries_its_path_to_the_model(self) -> None:
         picture = Path(self.tmpdir.name) / "blood.jpg"
-        picture.write_bytes(b"\xff\xd8\xff\xe0JPEGBYTES\x00data")
-        (Path(self.tmpdir.name) / "notes.txt").write_text("hello\n", "utf-8")
+        _ = picture.write_bytes(b"\xff\xd8\xff\xe0JPEGBYTES\x00data")
+        _ = (Path(self.tmpdir.name) / "notes.txt").write_text("hello\n", "utf-8")
         output = self._run_agent(
             ["compare blood.jpg and notes.txt\n", "\n"], responses=["REPLY"]
         )
@@ -830,13 +923,13 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("You: compare blood.jpg and notes.txt", output)
 
     def test_prompt_without_a_binary_file_is_sent_unchanged(self) -> None:
-        (Path(self.tmpdir.name) / "notes.txt").write_text("hello\n", "utf-8")
-        self._run_agent(["what is in notes.txt?\n", "\n"], responses=["REPLY"])
+        _ = (Path(self.tmpdir.name) / "notes.txt").write_text("hello\n", "utf-8")
+        _ = self._run_agent(["what is in notes.txt?\n", "\n"], responses=["REPLY"])
         self.assertEqual(self._last_user_prompts()[0], "what is in notes.txt?")
 
     def test_read_stays_inside_the_allowed_directories(self) -> None:
         secret = Path(self.tmpdir.name).parent / "secret.txt"
-        secret.write_text("top secret\n", encoding="utf-8")
+        _ = secret.write_text("top secret\n", encoding="utf-8")
         self.addCleanup(secret.unlink)
         output = self._run_agent(
             ["read the secret\n", "\n"],
@@ -847,7 +940,7 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_file_command_sends_file_contents_as_the_prompt(self) -> None:
         text = "Дать заключение по следующим данным\n\nГемоглобин 16.5\n"
-        (Path(self.tmpdir.name) / "kak.txt").write_text(text, encoding="utf-8")
+        _ = (Path(self.tmpdir.name) / "kak.txt").write_text(text, encoding="utf-8")
         output = self._run_agent(
             [f"{agent.FILE_COMMAND} kak.txt", ""], responses=["REPLY"]
         )
@@ -858,8 +951,8 @@ class AgentTTYTest(unittest.TestCase):
     def test_file_command_reads_a_quoted_path_with_spaces(self) -> None:
         text = "blood test\n"
         name = "my results.txt"
-        (Path(self.tmpdir.name) / name).write_text(text, encoding="utf-8")
-        self._run_agent(
+        _ = (Path(self.tmpdir.name) / name).write_text(text, encoding="utf-8")
+        _ = self._run_agent(
             [f'{agent.FILE_COMMAND} "{name}"', ""], responses=["REPLY"]
         )
         self.assertEqual(self._last_user_prompts(), [text])
@@ -870,7 +963,7 @@ class AgentTTYTest(unittest.TestCase):
         self.assertEqual(FakeOllamaHandler.payloads, [])
 
     def test_file_command_reports_a_binary_file(self) -> None:
-        (Path(self.tmpdir.name) / "blood.jpg").write_bytes(
+        _ = (Path(self.tmpdir.name) / "blood.jpg").write_bytes(
             b"\xff\xd8\xff\xe0JPEGBYTES\x00data"
         )
         output = self._run_agent([f"{agent.FILE_COMMAND} blood.jpg", ""])
@@ -880,7 +973,7 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_file_command_stays_inside_the_allowed_directories(self) -> None:
         secret = Path(self.tmpdir.name).parent / "prompt-secret.txt"
-        secret.write_text("top secret\n", encoding="utf-8")
+        _ = secret.write_text("top secret\n", encoding="utf-8")
         self.addCleanup(secret.unlink)
         output = self._run_agent([f"{agent.FILE_COMMAND} {secret}", ""])
         self.assertIn("outside", output)
@@ -889,8 +982,8 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_file_command_can_be_embedded_in_the_prompt(self) -> None:
         text = "Гемоглобин 16.5"
-        (Path(self.tmpdir.name) / "kak.txt").write_text(text, encoding="utf-8")
-        self._run_agent(
+        _ = (Path(self.tmpdir.name) / "kak.txt").write_text(text, encoding="utf-8")
+        _ = self._run_agent(
             [f"Translate each line: {agent.FILE_COMMAND} kak.txt", ""],
             responses=["REPLY"],
         )
@@ -900,12 +993,12 @@ class AgentTTYTest(unittest.TestCase):
         )
 
     def test_several_file_commands_are_all_inserted(self) -> None:
-        (Path(self.tmpdir.name) / "a.txt").write_text("alpha", encoding="utf-8")
-        (Path(self.tmpdir.name) / "b.txt").write_text("beta", encoding="utf-8")
-        self._run_agent(
+        _ = (Path(self.tmpdir.name) / "a.txt").write_text("alpha", encoding="utf-8")
+        _ = (Path(self.tmpdir.name) / "b.txt").write_text("beta", encoding="utf-8")
+        _ = self._run_agent(
             [
                 f"Compare {agent.FILE_COMMAND} a.txt with "
-                f"{agent.FILE_COMMAND} b.txt",
+                + f"{agent.FILE_COMMAND} b.txt",
                 "",
             ],
             responses=["REPLY"],
@@ -914,15 +1007,15 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_file_command_reads_a_quoted_path_inside_a_prompt(self) -> None:
         name = "my results.txt"
-        (Path(self.tmpdir.name) / name).write_text("blood test", encoding="utf-8")
-        self._run_agent(
+        _ = (Path(self.tmpdir.name) / name).write_text("blood test", encoding="utf-8")
+        _ = self._run_agent(
             [f'Summarize {agent.FILE_COMMAND} "{name}" briefly', ""],
             responses=["REPLY"],
         )
         self.assertEqual(self._last_user_prompts(), ["Summarize blood test briefly"])
 
     def test_embedded_file_command_aborts_when_the_file_cannot_be_read(self) -> None:
-        (Path(self.tmpdir.name) / "blood.jpg").write_bytes(
+        _ = (Path(self.tmpdir.name) / "blood.jpg").write_bytes(
             b"\xff\xd8\xff\xe0JPEGBYTES\x00data"
         )
         output = self._run_agent(
@@ -933,7 +1026,7 @@ class AgentTTYTest(unittest.TestCase):
         self.assertEqual(FakeOllamaHandler.payloads, [])
 
     def test_search_and_read_can_follow_each_other(self) -> None:
-        (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", encoding="utf-8")
+        _ = (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", encoding="utf-8")
         output = self._run_agent(
             ["check a.txt\n", "\n"],
             responses=["[READ: a.txt]", "[SEARCH: a.txt meaning]", "Alpha."],
@@ -1036,7 +1129,7 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("Cannot fetch the weather", agent.weather_forecast())
 
     def test_tool_is_not_run_forever(self) -> None:
-        (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", encoding="utf-8")
+        _ = (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", encoding="utf-8")
         output = self._run_agent(
             ["check a.txt\n", "\n"],
             responses=["[READ: a.txt]"] * (agent.MAX_TOOL_ROUNDS + 1),
@@ -1048,7 +1141,7 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_image_attached_to_the_request(self) -> None:
         picture = Path(self.tmpdir.name) / "blood.jpg"
-        picture.write_bytes(b"\xff\xd8\xff\xe0JPEGBYTES\x00data")
+        _ = picture.write_bytes(b"\xff\xd8\xff\xe0JPEGBYTES\x00data")
         output = self._run_agent(
             ["что на картинке blood.jpg\n", "\n"],
             responses=["[IMAGE: blood.jpg]", "Это анализ крови."],
@@ -1065,8 +1158,8 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn(agent.ANSWER_FROM_RESULT, texts)
 
     def test_image_of_a_file_that_is_not_one_is_refused(self) -> None:
-        (Path(self.tmpdir.name) / "notes.txt").write_text("hello\n", "utf-8")
-        self._run_agent(
+        _ = (Path(self.tmpdir.name) / "notes.txt").write_text("hello\n", "utf-8")
+        _ = self._run_agent(
             ["look at notes.txt\n", "\n"],
             responses=["[IMAGE: notes.txt]", "It is a text file."],
         )
@@ -1075,22 +1168,22 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_image_outside_the_allowed_directories_is_refused(self) -> None:
         secret = Path(self.tmpdir.name).parent / "secret.png"
-        secret.write_bytes(b"\x89PNG\r\n\x1a\n\x00data")
+        _ = secret.write_bytes(b"\x89PNG\r\n\x1a\n\x00data")
         self.addCleanup(secret.unlink)
-        self._run_agent(
+        _ = self._run_agent(
             ["look at the secret\n", "\n"],
             responses=[f"[IMAGE: {secret}]", "I cannot see it."],
         )
         self.assertIn("outside", self._last_user_prompts()[-1])
 
     def test_image_bigger_than_the_cap_is_not_attached(self) -> None:
-        (Path(self.tmpdir.name) / "big.png").write_bytes(
+        _ = (Path(self.tmpdir.name) / "big.png").write_bytes(
             b"\x89PNG\r\n\x1a\n" + b"x" * 99
         )
         old = agent.IMAGE_MAX_BYTES
         agent.IMAGE_MAX_BYTES = 10
         self.addCleanup(setattr, agent, "IMAGE_MAX_BYTES", old)
-        self._run_agent(
+        _ = self._run_agent(
             ["look at big.png\n", "\n"], responses=["[IMAGE: big.png]", "No."]
         )
         self.assertIn("at most 10 are attached", self._last_user_prompts()[-1])
@@ -1098,10 +1191,10 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_older_image_is_dropped_from_the_history(self) -> None:
         for name in ("one.jpg", "two.jpg"):
-            (Path(self.tmpdir.name) / name).write_bytes(
+            _ = (Path(self.tmpdir.name) / name).write_bytes(
                 b"\xff\xd8\xff\xe0" + name.encode()
             )
-        self._run_agent(
+        _ = self._run_agent(
             ["one", "two", "three", ""],
             responses=[
                 "[IMAGE: one.jpg]",
@@ -1121,10 +1214,10 @@ class AgentTTYTest(unittest.TestCase):
         self.assertIn("one.jpg", parts)
 
     def test_saved_prompt_holds_no_image_data(self) -> None:
-        (Path(self.tmpdir.name) / "blood.jpg").write_bytes(
+        _ = (Path(self.tmpdir.name) / "blood.jpg").write_bytes(
             b"\xff\xd8\xff\xe0" + b"x" * 40
         )
-        self._run_agent(
+        _ = self._run_agent(
             ["look at blood.jpg\n", "\n"],
             responses=["[IMAGE: blood.jpg]", "It shows a blood test."],
         )
@@ -1141,7 +1234,7 @@ class AgentTTYTest(unittest.TestCase):
             if m["role"] == "user" and isinstance(m["content"], str)
         ]
 
-    def _image_urls(self, payload: dict[str, typing.Any]) -> list[str]:
+    def _image_urls(self, payload: FakePayload) -> list[str]:
         """URL of every `image_url` part the model was sent in this request."""
         return [
             part["image_url"]["url"]
@@ -1151,20 +1244,25 @@ class AgentTTYTest(unittest.TestCase):
             if part["type"] == "image_url"
         ]
 
-    def _part_texts(self, payload: dict[str, typing.Any]) -> str:
+    def _part_texts(self, payload: FakePayload) -> str:
         """Every text part of a request, plus its plain text messages."""
         return "\n".join(
             part["text"]
             for message in payload["messages"]
             for part in (
-                [{"type": "text", "text": message["content"]}]
+                [
+                    cast(
+                        "agent.TextPart",
+                        cast(object, {"type": "text", "text": message["content"]}),
+                    )
+                ]
                 if isinstance(message["content"], str)
                 else message["content"]
             )
             if part["type"] == "text"
         )
 
-    def _audio_blocks(self) -> list[dict[str, typing.Any]]:
+    def _audio_blocks(self) -> list[agent.InputAudio]:
         """Audio blocks of every `input_audio` part the model was sent."""
         return [
             part["input_audio"]
@@ -1175,7 +1273,7 @@ class AgentTTYTest(unittest.TestCase):
             if part["type"] == "input_audio"
         ]
 
-    @unittest.skipIf(agent.readline is None, "readline is not available")
+    @unittest.skipIf(readline is None, "readline is not available")
     def test_up_arrow_repeats_previous_command(self) -> None:
         output = self._run_agent(["hello", "\x1b[A", ""], responses=["ONE", "TWO"])
         self.assertIn("Assistant: ONE", output)
@@ -1184,7 +1282,7 @@ class AgentTTYTest(unittest.TestCase):
         self.assertEqual(len(FakeOllamaHandler.payloads), 2)
         self.assertEqual(self._last_user_prompts(), ["hello", "hello"])
 
-    @unittest.skipIf(agent.readline is None, "readline is not available")
+    @unittest.skipIf(readline is None, "readline is not available")
     def test_down_arrow_returns_to_empty_input(self) -> None:
         # Walking up and back down leaves the input empty, so the agent exits
         # and never shows a third prompt: the last line is typed ahead.
@@ -1198,47 +1296,51 @@ class AgentTTYTest(unittest.TestCase):
         self.assertEqual(len(FakeOllamaHandler.payloads), 1)
         self.assertNotIn("Assistant: TWO", output)
 
-    @unittest.skipIf(agent.readline is None, "readline is not available")
+    @unittest.skipIf(readline is None, "readline is not available")
     def test_prompts_persisted_for_next_session(self) -> None:
-        self._run_agent(["hello", ""])
+        _ = self._run_agent(["hello", ""])
         history = Path(agent.HISTORY_FILE).read_text(encoding="utf-8")
         self.assertIn("hello", history)
 
-    @unittest.skipIf(agent.readline is None, "readline is not available")
+    @unittest.skipIf(readline is None, "readline is not available")
     def test_up_arrow_recalls_prompt_from_previous_session(self) -> None:
         Path(agent.HISTORY_FILE).parent.mkdir(parents=True, exist_ok=True)
-        Path(agent.HISTORY_FILE).write_text("prompt from last time\n", encoding="utf-8")
+        _ = Path(agent.HISTORY_FILE).write_text("prompt from last time\n", encoding="utf-8")
         output = self._run_agent(["\x1b[A", ""], responses=["REPLY"])
         self.assertIn("Assistant: REPLY", output)
         self.assertIn("Bye!", output)
         self.assertEqual(self._last_user_prompts(), ["prompt from last time"])
 
-    @unittest.skipIf(agent.readline is None, "readline is not available")
+    @unittest.skipIf(readline is None, "readline is not available")
     def test_history_file_capped_to_limit(self) -> None:
+        assert readline is not None  # the skipIf decorator guarantees it
         Path(agent.HISTORY_FILE).parent.mkdir(parents=True, exist_ok=True)
         stored = "".join(f"old prompt {i}\n" for i in range(agent.HISTORY_LIMIT + 5))
-        Path(agent.HISTORY_FILE).write_text(stored, encoding="utf-8")
+        _ = Path(agent.HISTORY_FILE).write_text(stored, encoding="utf-8")
         agent.load_input_history()
-        length = agent.readline.get_current_history_length()
-        history = [agent.readline.get_history_item(i + 1) for i in range(length)]
+        length = readline.get_current_history_length()
+        history = [readline.get_history_item(i + 1) for i in range(length)]
         self.assertEqual(len(history), agent.HISTORY_LIMIT)
         self.assertEqual(history[-1], f"old prompt {agent.HISTORY_LIMIT + 4}")
 
     def test_last_prompt_sent_to_the_model_is_saved(self) -> None:
-        self._run_agent(["привет", ""], responses=["REPLY"])
-        saved = json.loads(Path(agent.LAST_PROMPT_FILE).read_text(encoding="utf-8"))
+        _ = self._run_agent(["привет", ""], responses=["REPLY"])
+        saved = decode_json(Path(agent.LAST_PROMPT_FILE).read_text(encoding="utf-8"))
+        messages = json_array(saved["messages"])
         self.assertEqual(saved["model"], "test-model")
-        self.assertEqual(saved["messages"][0]["role"], "system")
-        self.assertEqual(saved["messages"][-1]["content"], "привет")
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[-1]["content"], "привет")
         # The file holds the request, written unescaped so it stays readable.
         self.assertIn("привет", Path(agent.LAST_PROMPT_FILE).read_text("utf-8"))
 
     def test_last_prompt_file_holds_the_turn_that_ran_a_tool(self) -> None:
-        (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", "utf-8")
-        self._run_agent(["check a.txt", ""], responses=["[READ: a.txt]", "Alpha."])
-        saved = json.loads(Path(agent.LAST_PROMPT_FILE).read_text(encoding="utf-8"))
-        contents = [m["content"] for m in saved["messages"]]
-        self.assertIn("Contents of a.txt (1 lines):\n1: alpha", contents[-1])
+        _ = (Path(self.tmpdir.name) / "a.txt").write_text("alpha\n", "utf-8")
+        _ = self._run_agent(["check a.txt", ""], responses=["[READ: a.txt]", "Alpha."])
+        saved = decode_json(Path(agent.LAST_PROMPT_FILE).read_text(encoding="utf-8"))
+        contents = [m["content"] for m in json_array(saved["messages"])]
+        self.assertIn(
+            "Contents of a.txt (1 lines):\n1: alpha", cast(str, contents[-1])
+        )
 
     def test_voice_prompt_is_sent_as_audio_and_transcribed_by_the_model(
         self,
@@ -1285,7 +1387,7 @@ class AgentTTYTest(unittest.TestCase):
         self.assertEqual(self._last_user_prompts(), ["dictated", "hello"])
         # Only what was said reached the model: the noise of the pause did not.
         audio = base64.b64decode(self._audio_blocks()[0]["data"])
-        with fake_wave.open(fake_io.BytesIO(audio)) as wav:
+        with fake_wave.open(fake_io.BytesIO(audio), "rb") as wav:
             self.assertEqual(
                 wav.getnframes(),
                 (room + 1) * agent.VOICE_SAMPLE_RATE * agent.VOICE_BLOCK_MS // 1000,
@@ -1429,7 +1531,7 @@ class AgentTTYTest(unittest.TestCase):
         import numpy as np
 
         samples = np.zeros(agent.VOICE_SAMPLE_RATE, dtype="float32")
-        with fake_wave.open(fake_io.BytesIO(agent.encode_wav(samples))) as wav:
+        with fake_wave.open(fake_io.BytesIO(agent.encode_wav(samples)), "rb") as wav:
             self.assertEqual(wav.getnchannels(), 1)
             self.assertEqual(wav.getsampwidth(), 2)
             self.assertEqual(wav.getframerate(), agent.VOICE_SAMPLE_RATE)
@@ -1441,10 +1543,10 @@ class AgentTTYTest(unittest.TestCase):
 
         import numpy as np
 
-        def peak_of(samples: object) -> float:
-            with fake_wave.open(fake_io.BytesIO(agent.encode_wav(samples))) as wav:
+        def peak_of(samples: agent.AudioSamples) -> float:
+            with fake_wave.open(fake_io.BytesIO(agent.encode_wav(samples)), "rb") as wav:
                 pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
-            return float(np.max(np.abs(pcm))) / 32767
+            return float(cast("float", np.max(np.abs(pcm)))) / 32767
 
         # Speech spoken quietly is a whisper the model guesses at, so it is
         # brought up to a level it can transcribe.
@@ -1461,7 +1563,7 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_transcription_asks_the_model_and_skips_thinking(self) -> None:
         with fake_voice_modules():
-            self._run_agent(
+            _ = self._run_agent(
                 [agent.VOICE_COMMAND, "", ""],
                 responses=["typed out loud", "REPLY"],
                 markers=[b"You: ", b"Recording...", b"You: "],
@@ -1469,15 +1571,15 @@ class AgentTTYTest(unittest.TestCase):
         first = FakeOllamaHandler.payloads[0]
         self.assertEqual(first["model"], "test-model")
         self.assertEqual(first["reasoning_effort"], "none")
-        parts = first["messages"][0]["content"]
+        parts = cast("list[agent.ContentPart]", first["messages"][0]["content"])
         self.assertEqual(parts[0]["type"], "text")
-        self.assertEqual(parts[0]["text"], agent.TRANSCRIBE_PROMPT)
+        self.assertEqual(cast("agent.TextPart", parts[0])["text"], agent.TRANSCRIBE_PROMPT)
         self.assertEqual(parts[1]["type"], "input_audio")
 
-    @unittest.skipIf(agent.readline is None, "readline is not available")
+    @unittest.skipIf(readline is None, "readline is not available")
     def test_voice_prompt_kept_in_input_history(self) -> None:
         with fake_voice_modules():
-            self._run_agent(
+            _ = self._run_agent(
                 [agent.VOICE_COMMAND, "", ""],
                 responses=["remember me", "REPLY"],
                 markers=[b"You: ", b"Recording...", b"You: "],
@@ -1572,7 +1674,7 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_voice_played_for_every_reply_while_on(self) -> None:
         with fake_voice_modules() as calls:
-            self._run_agent(
+            _ = self._run_agent(
                 [agent.SPEAK_COMMAND, "one", "two", ""],
                 responses=["FIRST", "SECOND"],
                 markers=[b"You: "] * 5,
@@ -1610,7 +1712,7 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_only_the_language_actually_spoken_is_downloaded(self) -> None:
         with fake_voice_modules() as calls:
-            self._run_agent(
+            _ = self._run_agent(
                 [agent.SPEAK_COMMAND, "one", "два", ""],
                 responses=["English answer", "Русский ответ"],
                 markers=[b"You: "] * 5,
@@ -1625,7 +1727,7 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_voice_downloaded_once_and_cached(self) -> None:
         with fake_voice_modules() as calls:
-            self._run_agent(
+            _ = self._run_agent(
                 [agent.SPEAK_COMMAND, "one", "two", ""],
                 responses=["FIRST", "SECOND"],
                 markers=[b"You: "] * 5,
@@ -1639,7 +1741,7 @@ class AgentTTYTest(unittest.TestCase):
             self.assertTrue(config_path.endswith(f"{agent.PIPER_VOICE_EN}.onnx.json"))
             # A second session reuses the files already on disk.
             calls["downloaded"].clear()
-            self._run_agent(
+            _ = self._run_agent(
                 [agent.SPEAK_COMMAND, "hello", ""],
                 responses=["REPLY"],
                 markers=[b"You: "] * 3,
@@ -1666,7 +1768,7 @@ class AgentTTYTest(unittest.TestCase):
         self.assertEqual(
             agent.speakable_text(
                 "Here is `print(1)` and [docs](https://example.com/x) plus "
-                "https://example.org/y\n\n```python\nprint('nope')\n```\n**Done!**"
+                + "https://example.org/y\n\n```python\nprint('nope')\n```\n**Done!**"
             ),
             "Here is print(1) and docs plus link Done!",
         )
@@ -1728,7 +1830,7 @@ class AgentTTYTest(unittest.TestCase):
 
     def test_translate_command_is_kept_in_input_history(self) -> None:
         with fake_voice_modules():
-            self._run_agent([agent.TRANSLATE_COMMAND, ""], responses=["REPLY"])
+            _ = self._run_agent([agent.TRANSLATE_COMMAND, ""], responses=["REPLY"])
         history = Path(agent.HISTORY_FILE).read_text(encoding="utf-8")
         self.assertIn(agent.TRANSLATE_COMMAND, history)
 
@@ -1745,35 +1847,43 @@ class AgentTTYTest(unittest.TestCase):
             [agent.TRANSLATE_PROMPT_RU, "какая погода"],
         )
 
+    @staticmethod
+    def _system_content() -> str:
+        content = FakeOllamaHandler.payloads[-1]["messages"][0]["content"]
+        assert isinstance(content, str)  # the system prompt is plain text
+        return content
+
     def test_default_system_prompt_answers_in_russian(self) -> None:
         with fake_voice_modules():
-            self._run_agent(["привет", ""], responses=["REPLY"])
+            _ = self._run_agent(["привет", ""], responses=["REPLY"])
         system = FakeOllamaHandler.payloads[-1]["messages"][0]
         self.assertEqual(system["role"], "system")
-        self.assertIn("Answer in Russian", system["content"])
-        self.assertNotIn("Answer in English", system["content"])
+        content = self._system_content()
+        self.assertIn("Answer in Russian", content)
+        self.assertNotIn("Answer in English", content)
 
     def test_translate_command_ru_switches_the_answers_to_english(self) -> None:
         # The system prompt must name English too, or /r only asks for the
         # translation while the system prompt still forces Russian answers.
         with fake_voice_modules():
-            self._run_agent(
+            _ = self._run_agent(
                 [agent.TRANSLATE_COMMAND_RU, "какая погода", ""],
                 responses=["FIRST", "SECOND"],
             )
         system = FakeOllamaHandler.payloads[-1]["messages"][0]
         self.assertEqual(system["role"], "system")
-        self.assertIn("Answer in English", system["content"])
-        self.assertNotIn("Answer in Russian", system["content"])
+        content = self._system_content()
+        self.assertIn("Answer in English", content)
+        self.assertNotIn("Answer in Russian", content)
         # The language comes last, so no rule after it can contradict it.
         self.assertEqual(
-            system["content"].splitlines()[-1],
+            content.splitlines()[-1],
             agent.ANSWER_IN.format(language=agent.REPLY_LANGUAGE_EN),
         )
 
     def test_translate_command_e_switches_the_answers_back_to_russian(self) -> None:
         with fake_voice_modules():
-            self._run_agent(
+            _ = self._run_agent(
                 [
                     agent.TRANSLATE_COMMAND_RU,
                     "hello",
@@ -1783,10 +1893,10 @@ class AgentTTYTest(unittest.TestCase):
                 ],
                 responses=["ONE", "TWO", "THREE", "FOUR"],
             )
-        system = FakeOllamaHandler.payloads[-1]["messages"][0]
-        self.assertIn("Answer in Russian", system["content"])
-        self.assertNotIn("Answer in English", system["content"])
+        content = self._system_content()
+        self.assertIn("Answer in Russian", content)
+        self.assertNotIn("Answer in English", content)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    _ = unittest.main()

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Interactive CLI AI agent with conversation history, tools and voice."""
 
+from __future__ import annotations
+
 import argparse
 import base64
 import functools
@@ -8,6 +10,7 @@ import html
 import http.server
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -21,8 +24,30 @@ from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if TYPE_CHECKING:  # voice support is optional at runtime, but typed here
+    import numpy as np
+    import numpy.typing as npt
+    from piper import PiperVoice
+
+    class AudioStream(Protocol):
+        def __enter__(self) -> AudioStream: ...
+        def __exit__(self, *exc: object) -> object: ...
+
+    class SoundDevice(Protocol):
+        """The part of sounddevice this agent uses, since it ships no stubs."""
+
+        PortAudioError: type[Exception]
+
+        def RawInputStream(self, **kwargs: object) -> AudioStream: ...
+
+        def play(self, data: AudioSamples, samplerate: int) -> None: ...
+
+        def wait(self) -> object: ...
+
+        def stop(self) -> None: ...
 
 try:  # readline is POSIX-only, may be missing on Windows or embedded builds
     import readline
@@ -40,6 +65,117 @@ try:  # select is POSIX-only, used to watch for a keypress without blocking
     import select
 except ImportError:
     select = None  # type: ignore[assignment]
+
+# The shapes sent to and received from the model. The parts of a message are
+# spelled out so that every place handling them knows what keys it can use;
+# JSON decoded from a response is narrow where it is read, not left as Any.
+JsonValue: TypeAlias = (
+    "None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]"
+)
+JsonObject: TypeAlias = "dict[str, JsonValue]"
+
+
+class TextPart(TypedDict):
+    type: Literal["text"]
+    text: str
+
+
+class ImageUrl(TypedDict):
+    url: str
+
+
+class ImagePart(TypedDict):
+    type: Literal["image_url"]
+    image_url: ImageUrl
+
+
+class InputAudio(TypedDict):
+    data: str
+    format: str
+
+
+class AudioPart(TypedDict):
+    type: Literal["input_audio"]
+    input_audio: InputAudio
+
+
+ContentPart: TypeAlias = TextPart | ImagePart | AudioPart
+Content: TypeAlias = str | list[ContentPart]
+
+
+class Message(TypedDict):
+    role: str
+    content: Content
+
+
+class ChatRequest(TypedDict):
+    model: str
+    messages: list[Message]
+    stream: bool
+    session_id: str
+
+
+AudioSamples: TypeAlias = "npt.NDArray[np.float32]"
+
+
+def _sound_device() -> SoundDevice:
+    """Import the optional playback library, giving it a typed surface."""
+    import sounddevice as sd  # pyright: ignore[reportMissingTypeStubs]
+
+    return cast("SoundDevice", sd)  # pyright: ignore[reportInvalidCast]
+
+
+def as_object(value: object) -> dict[str, object]:
+    """Treat a decoded JSON value as an object, failing loudly otherwise.
+
+    Args:
+        value: a value decoded from JSON.
+
+    Returns:
+        The object, with its values still to be checked by the caller.
+
+    Raises:
+        KeyError: if the value is not a JSON object.
+    """
+    if not isinstance(value, dict):
+        raise KeyError("expected a JSON object")
+    return cast("dict[str, object]", value)
+
+
+def _fetch_text(url: str | urllib.request.Request, timeout: int) -> str:
+    """Read an HTTP response as text, whatever bytes it answers with."""
+    with cast(
+        io.BufferedIOBase, urllib.request.urlopen(url, timeout=timeout)
+    ) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def _fetch_json(url: str | urllib.request.Request, timeout: int) -> object:
+    """Read and decode an HTTP response as JSON."""
+    return cast(object, json.loads(_fetch_text(url, timeout)))
+
+
+def _reply_text(data: object) -> str:
+    """Take the assistant's message out of a chat-completion response.
+
+    Args:
+        data: a value decoded from the model's JSON response.
+
+    Returns:
+        The text of the first choice.
+
+    Raises:
+        KeyError: if the response does not have the expected shape.
+    """
+    choices = as_object(data)["choices"]
+    if not isinstance(choices, list) or not choices:
+        raise KeyError("choices")
+    message = as_object(as_object(cast("list[object]", choices)[0])["message"])
+    content = message["content"]
+    if not isinstance(content, str):
+        raise KeyError("content")
+    return content
+
 
 # Configuration: model, API endpoint, history limit, search service
 MODEL: str = "gemma4:latest"
@@ -190,7 +326,7 @@ def system_prompt(language: str = DEFAULT_REPLY_LANGUAGE) -> str:
     return f"{SYSTEM_PROMPT}\n{ANSWER_IN.format(language=language)}"
 
 
-def set_reply_language(messages: list[dict[str, Any]], language: str) -> None:
+def set_reply_language(messages: list[Message], language: str) -> None:
     """Make the model answer in `language` for the rest of the dialog.
 
     The system message is rewritten rather than a second one appended: a small
@@ -370,6 +506,20 @@ def current_datetime(argument: str = "") -> str:
 HTML_TAG_RE: re.Pattern[str] = re.compile(r"<[^>]+>")
 
 
+def _findall(
+    pattern: str | re.Pattern[str], text: str, flags: int = 0
+) -> list[tuple[str, ...]]:
+    """Find every match as a tuple of texts, one per capturing group.
+
+    ``re.findall`` is typed as returning ``Any`` here, so the matches are read
+    through ``finditer``, whose groups are known to be strings.
+    """
+    return [
+        match.groups("") if match.groups() else (match.group(0),)
+        for match in re.finditer(pattern, text, flags)
+    ]
+
+
 def _plain_html(fragment: str) -> str:
     """Turn an HTML fragment into one line of text.
 
@@ -431,7 +581,7 @@ def parse_weather(page: str) -> str:
             )
         # The wind, the pressure and the humidity are the list items of the
         # block; their labels are Russian, their values are what is shown.
-        for item in re.findall(r"<li[^>]*>(.*?)</li>", block, re.DOTALL):
+        for (item,) in _findall(r"<li[^>]*>(.*?)</li>", block, re.DOTALL):
             text = _plain_html(item)
             for label, english in (
                 ("Ветер:", "Wind:"),
@@ -443,10 +593,10 @@ def parse_weather(page: str) -> str:
         # The time of day ("Днём", "Вечером", "Ночью") with its weather.
         parts = [
             " ".join(filter(None, (_plain_html(part) for part in found)))
-            for found in re.findall(
+            for found in _findall(
                 r'<span class="ext-time">([^<]*)</span>'
-                r'<span class="ext-cond">(.*?)</span>'
-                r'<span class="ext-text">([^<]*)</span>',
+                + r'<span class="ext-cond">(.*?)</span>'
+                + r'<span class="ext-text">([^<]*)</span>',
                 block,
                 re.DOTALL,
             )
@@ -475,7 +625,7 @@ def parse_weather(page: str) -> str:
         )
         night = re.search(
             r'<div class="nprt[^"]*">\s*Ночью:\s*'
-            r'<span class="n_tmp">([^<]+)</span>(.*?)</div>',
+            + r'<span class="n_tmp">([^<]+)</span>(.*?)</div>',
             cell,
             re.DOTALL,
         )
@@ -500,7 +650,7 @@ def parse_weather(page: str) -> str:
         if details:
             bits = [
                 _plain_html(f"<p>{paragraph}</p>")
-                for paragraph in re.findall(
+                for (paragraph,) in _findall(
                     r"<p[^>]*>(.*?)</p>", details.group(1), re.DOTALL
                 )
             ]
@@ -541,8 +691,7 @@ def weather_forecast(argument: str = "") -> str:
         headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=WEATHER_TIMEOUT) as resp:
-            page = resp.read().decode("utf-8", errors="replace")
+        page = _fetch_text(request, WEATHER_TIMEOUT)
     except (urllib.error.URLError, OSError) as e:
         return f"Cannot fetch the weather from {WEATHER_URL}: {e}"
     forecast = parse_weather(page)
@@ -569,13 +718,13 @@ def _get_weather(location: str) -> str:
             + "?"
             + urllib.parse.urlencode({"name": location, "count": 1})
         )
-        with urllib.request.urlopen(geo_url, timeout=10) as resp:
-            geo = json.loads(resp.read().decode("utf-8"))
+        geo = as_object(_fetch_json(geo_url, 10))
         results = geo.get("results", [])
-        if not results:
+        if not isinstance(results, list) or not results:
             return ""
-        lat, lon = results[0]["latitude"], results[0]["longitude"]
-        name = results[0].get("name", location)
+        first = as_object(cast("list[object]", results)[0])
+        lat, lon = first["latitude"], first["longitude"]
+        name = first.get("name", location)
 
         wx_url = (
             OPEN_METEO_WX
@@ -588,14 +737,13 @@ def _get_weather(location: str) -> str:
                 }
             )
         )
-        with urllib.request.urlopen(wx_url, timeout=10) as resp:
-            wx = json.loads(resp.read().decode("utf-8"))
+        wx = as_object(_fetch_json(wx_url, 10))
 
-        cw = wx.get("current_weather", {})
+        cw = as_object(wx.get("current_weather", {}))
         temp = cw.get("temperature")
         wind = cw.get("windspeed")
         desc = cw.get("weathercode")
-        WMO = {
+        WMO: dict[object, str] = {
             0: "Clear sky",
             1: "Mainly clear",
             2: "Partly cloudy",
@@ -655,18 +803,17 @@ def search_web(query: str) -> str:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            page = resp.read().decode("utf-8", errors="replace")
+        page = _fetch_text(req, 30)
     except (urllib.error.URLError, OSError) as e:
         return f"Search error: {e}"
 
-    titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', page)
-    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page)
+    titles = _findall(r'class="result__a"[^>]*>(.*?)</a>', page)
+    snippets = _findall(r'class="result__snippet"[^>]*>(.*?)</a>', page)
 
     results: list[str] = []
     for i in range(min(len(titles), len(snippets), MAX_SEARCH_RESULTS)):
-        title = html.unescape(re.sub(r"<[^>]+>", "", titles[i])).strip()
-        snippet = html.unescape(re.sub(r"<[^>]+>", "", snippets[i])).strip()
+        title = html.unescape(re.sub(r"<[^>]+>", "", titles[i][0])).strip()
+        snippet = html.unescape(re.sub(r"<[^>]+>", "", snippets[i][0])).strip()
         results.append(f"{i + 1}. {title}\n   {snippet}")
 
     if not results:
@@ -758,7 +905,7 @@ def binary_paths_note(prompt: str) -> str:
     """
     noted: list[str] = []
     seeable: bool = False
-    for name in dict.fromkeys(PROMPT_PATH_RE.findall(prompt)):
+    for (name,) in dict.fromkeys(_findall(PROMPT_PATH_RE, prompt)):
         target, _ = resolve_read_path(name)
         if target is None or not is_binary(target):
             continue
@@ -923,7 +1070,7 @@ def expand_file_commands(line: str) -> str:
     return "".join(parts)
 
 
-def read_image(path: str) -> str | list[dict[str, Any]]:
+def read_image(path: str) -> str | list[ContentPart]:
     """Attach an image file so the model can look at it.
 
     The model takes images as base64 data URLs in an `image_url` part of a
@@ -963,7 +1110,7 @@ def read_image(path: str) -> str | list[dict[str, Any]]:
     ]
 
 
-def image_note(parts: list[dict[str, Any]]) -> str:
+def image_note(parts: list[ContentPart]) -> str:
     """Return the text of a message built by read_image, without the image.
 
     Args:
@@ -972,11 +1119,11 @@ def image_note(parts: list[dict[str, Any]]) -> str:
     Returns:
         The text of the first text part, or an empty string.
     """
-    texts = [part.get("text", "") for part in parts if part.get("type") == "text"]
+    texts = [part["text"] for part in parts if part["type"] == "text"]
     return texts[0] if texts else ""
 
 
-def drop_stale_images(messages: list[dict[str, Any]]) -> None:
+def drop_stale_images(messages: list[Message]) -> None:
     """Keep the bytes of the newest IMAGE_HISTORY_KEEP images only.
 
     An image costs hundreds of kilobytes of base64 in every request made after
@@ -996,20 +1143,20 @@ def drop_stale_images(messages: list[dict[str, Any]]) -> None:
         message
         for message in messages
         if isinstance(message["content"], list)
-        and any(part.get("type") == "image_url" for part in message["content"])
+        and any(part["type"] == "image_url" for part in message["content"])
     ]
     for message in attached[:-IMAGE_HISTORY_KEEP]:
-        note = image_note(message["content"])
-        message["content"] = [{"type": "text", "text": f"{note}\n{IMAGE_DROPPED}"}]
+        content = message["content"]
+        if isinstance(content, list):
+            note = image_note(content)
+            message["content"] = [{"type": "text", "text": f"{note}\n{IMAGE_DROPPED}"}]
 
 
 # Tools the model can ask for by writing a tag into its reply: the tag name, the
 # pattern that recognizes it, and the function that carries it out. Each returns
 # the content of the next message: text for the tools that answer with text,
 # content parts for the ones that attach an image.
-TOOLS: dict[
-    str, tuple[re.Pattern[str], Callable[[str], str | list[dict[str, Any]]]]
-] = {
+TOOLS: dict[str, tuple[re.Pattern[str], Callable[[str], str | list[ContentPart]]]] = {
     "DATE": (DATE_RE, current_datetime),
     "WEATHER": (WEATHER_TAG_RE, weather_forecast),
     "SEARCH": (SEARCH_RE, search_web),
@@ -1018,7 +1165,7 @@ TOOLS: dict[
 }
 
 
-def chat(messages: list[dict[str, Any]], session_id: str) -> str:
+def chat(messages: list[Message], session_id: str) -> str:
     """Send a chat request to Ollama and return the model's response.
 
     The request is also written to LAST_PROMPT_FILE, so the prompt behind the
@@ -1035,7 +1182,7 @@ def chat(messages: list[dict[str, Any]], session_id: str) -> str:
     Raises:
         URLError, KeyError, or json.JSONDecodeError if the request fails.
     """
-    request = {
+    request: ChatRequest = {
         "model": MODEL,
         "messages": messages,
         "stream": False,
@@ -1051,13 +1198,10 @@ def chat(messages: list[dict[str, Any]], session_id: str) -> str:
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-
-    return data["choices"][0]["message"]["content"]
+    return _reply_text(_fetch_json(req, OLLAMA_TIMEOUT))
 
 
-def without_media_data(content: Any) -> Any:
+def without_media_data(content: Content) -> Content:
     """Copy a message content with the payload of its media parts taken out.
 
     An image or a recording is a long base64 string that would make the saved
@@ -1073,18 +1217,24 @@ def without_media_data(content: Any) -> Any:
     """
     if not isinstance(content, list):
         return content
-    parts: list[dict[str, Any]] = []
+    parts: list[ContentPart] = []
     for part in content:
-        if part.get("type") == "image_url":
+        if part["type"] == "image_url":
             parts.append(
                 {"type": "image_url", "image_url": {"url": f"data:...{MEDIA_LOGGED}"}}
             )
-        elif part.get("type") == "input_audio":
-            audio = {**part.get("input_audio", {})}
-            audio["data"] = MEDIA_LOGGED
-            parts.append({"type": "input_audio", "input_audio": audio})
+        elif part["type"] == "input_audio":
+            parts.append(
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": MEDIA_LOGGED,
+                        "format": part["input_audio"]["format"],
+                    },
+                }
+            )
         else:
-            parts.append(dict(part))
+            parts.append(part)
     return parts
 
 
@@ -1093,7 +1243,7 @@ def without_media_data(content: Any) -> Any:
 LAST_PROMPT_LOCK = threading.Lock()
 
 
-def save_last_prompt(request: dict[str, Any]) -> None:
+def save_last_prompt(request: ChatRequest) -> None:
     """Write the request sent to the model to LAST_PROMPT_FILE.
 
     The file is replaced on every request, so it always holds the prompt the
@@ -1114,14 +1264,14 @@ def save_last_prompt(request: dict[str, Any]) -> None:
         **request,
         "messages": [
             {**message, "content": without_media_data(message["content"])}
-            for message in request.get("messages", [])
+            for message in request["messages"]
         ],
     }
     with LAST_PROMPT_LOCK:
         try:
             path = Path(LAST_PROMPT_FILE)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
+            _ = path.write_text(
                 json.dumps(logged, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         except OSError:
@@ -1317,16 +1467,16 @@ def wait_for_stop(is_done: Callable[[], bool]) -> bool:
         `is_done` did.
     """
     if termios is None or tty is None or select is None:
-        sys.stdin.readline()
+        _ = sys.stdin.readline()
         return True
     fd = sys.stdin.fileno()
     try:
         saved = termios.tcgetattr(fd)
     except (termios.error, OSError, ValueError):  # not a terminal (piped input)
-        sys.stdin.readline()
+        _ = sys.stdin.readline()
         return True
     try:
-        tty.setcbreak(fd)
+        _ = tty.setcbreak(fd)
         while True:
             if is_done():
                 # A keypress that raced with the pause belongs to the
@@ -1347,7 +1497,7 @@ def wait_for_stop(is_done: Callable[[], bool]) -> bool:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def record_voice() -> Any:
+def record_voice() -> AudioSamples:
     """Record mono 16 kHz audio from the default microphone.
 
     Recording ends on Enter or on a pause of VOICE_SILENCE_MS, whichever
@@ -1363,17 +1513,20 @@ def record_voice() -> Any:
         OSError: if the microphone cannot be opened.
     """
     import numpy as np
-    import sounddevice as sd
 
-    blocks: list[Any] = []
+    sd = _sound_device()
+    blocks: list[AudioSamples] = []
     watcher = PauseWatcher()
 
-    def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
+    def callback(
+        indata: AudioSamples, frames: int, time_info: object, status: object
+    ) -> None:
+        _ = frames, time_info, status
         # A raw stream hands out a buffer over memory that PortAudio reuses
         # for the next block, so the samples have to be copied out.
-        block = np.frombuffer(indata, dtype="float32").copy()
+        block: AudioSamples = np.frombuffer(indata, dtype="float32").copy()
         blocks.append(block)
-        watcher.add(float(np.sqrt(np.mean(block * block))), len(block))
+        watcher.add(math.sqrt(float(np.mean(block * block))), len(block))
 
     block_size = int(VOICE_SAMPLE_RATE * VOICE_BLOCK_MS / 1000)
     try:
@@ -1386,7 +1539,7 @@ def record_voice() -> Any:
         ):
             print(
                 "Recording... press Enter to stop, a"
-                f" {VOICE_SILENCE_MS // 1000}s pause ends it, Ctrl+C to cancel",
+                + f" {VOICE_SILENCE_MS // 1000}s pause ends it, Ctrl+C to cancel",
                 flush=True,
             )
             by_enter = wait_for_stop(lambda: watcher.paused)
@@ -1404,7 +1557,7 @@ def record_voice() -> Any:
         # instead, to make a threshold easy to tune.
         print(
             f"Nothing said over the noise: {watcher.noise:.4f} is the noise,"
-            f" {watcher.threshold:.4f} is what counts as speech.",
+            + f" {watcher.threshold:.4f} is what counts as speech.",
             flush=True,
         )
         return np.empty(0, dtype="float32")
@@ -1412,7 +1565,7 @@ def record_voice() -> Any:
     return np.concatenate(blocks[: watcher.voice_blocks])
 
 
-def encode_wav(audio: Any) -> bytes:
+def encode_wav(audio: AudioSamples) -> bytes:
     """Wrap recorded samples into a WAV file held in memory.
 
     The microphone hands out float samples, while the model wants a WAV
@@ -1433,7 +1586,7 @@ def encode_wav(audio: Any) -> bytes:
     import numpy as np
 
     pcm = np.clip(audio, -1.0, 1.0)
-    peak = float(np.max(np.abs(pcm))) if pcm.size else 0.0
+    peak = cast(float, np.max(np.abs(pcm))) if pcm.size else 0.0
     if 0.0 < peak < VOICE_PEAK:
         pcm = np.clip(pcm * min(VOICE_PEAK / peak, VOICE_MAX_GAIN), -1.0, 1.0)
     buffer = io.BytesIO()
@@ -1445,7 +1598,7 @@ def encode_wav(audio: Any) -> bytes:
     return buffer.getvalue()
 
 
-def decode_wav(data: bytes) -> Any:
+def decode_wav(data: bytes) -> AudioSamples:
     """Decode a mono 16-bit WAV file into float32 samples.
 
     The recordings of the Android app are mono, signed 16-bit PCM at
@@ -1475,7 +1628,7 @@ def decode_wav(data: bytes) -> Any:
     return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
 
 
-def transcribe_voice(audio: Any) -> str:
+def transcribe_voice(audio: AudioSamples) -> str:
     """Let the model transcribe the recording, by sending it the WAV itself.
 
     The audio is attached to a single request as an `input_audio` block, so
@@ -1522,10 +1675,7 @@ def transcribe_voice(audio: Any) -> str:
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-
-    return data["choices"][0]["message"]["content"].strip()
+    return _reply_text(_fetch_json(req, OLLAMA_TIMEOUT)).strip()
 
 
 def voice_prompt() -> str:
@@ -1609,7 +1759,7 @@ def speakable_text(text: str, link_word: str = "link") -> str:
 
 
 @functools.cache
-def load_piper(voice: str) -> Any:
+def load_piper(voice: str) -> PiperVoice:
     """Load a Piper TTS voice, reusing it on later calls.
 
     The voice (an ONNX model plus its config) is downloaded to TTS_DIR on the
@@ -1667,15 +1817,15 @@ def speak(text: str) -> None:
     spoken = speakable_text(text, TTS_LINK_WORDS[language])
     if not spoken:
         return
-    import sounddevice as sd
-
+    sd = _sound_device()
     chunks = list(load_piper(TTS_VOICES[language]).synthesize(spoken))
     if not chunks:
         return
     try:
         for chunk in chunks:
-            sd.play(chunk.audio_float_array, chunk.sample_rate)
-            sd.wait()
+            audio = cast("AudioSamples", chunk.audio_float_array)
+            sd.play(audio, chunk.sample_rate)
+            _ = sd.wait()
     finally:
         sd.stop()
 
@@ -1691,9 +1841,8 @@ def enable_voice_output() -> bool:
         (the reason is printed).
     """
     try:
-        import sounddevice  # noqa: F401  # verify playback is possible
-
-        load_piper(PIPER_VOICE_EN)
+        _ = _sound_device()  # verify playback is possible
+        _ = load_piper(PIPER_VOICE_EN)
     except ImportError as e:
         print(f"Error: {TTS_HINT} (missing: {e.name})")
         return False
@@ -1702,13 +1851,13 @@ def enable_voice_output() -> bool:
         return False
     print(
         f"Voice output on — {PIPER_VOICE_EN} / {PIPER_VOICE_RU}, "
-        f"picked per reply. Type {SPEAK_COMMAND} again to mute."
+        + f"picked per reply. Type {SPEAK_COMMAND} again to mute."
     )
     return True
 
 
 def ask_model(
-    messages: list[dict[str, Any]], session_id: str, errors: list[str] | None = None
+    messages: list[Message], session_id: str, errors: list[str] | None = None
 ) -> str | None:
     """Send the history to the model and report the usual failures.
 
@@ -1737,7 +1886,7 @@ def ask_model(
 
 
 def agent_turn(
-    messages: list[dict[str, Any]],
+    messages: list[Message],
     session_id: str,
     errors: list[str] | None = None,
 ) -> str | None:
@@ -1787,7 +1936,8 @@ def agent_turn(
         if isinstance(result, str):
             result = f"{result}\n\n{ANSWER_FROM_RESULT}"
         else:
-            result = [*result, {"type": "text", "text": ANSWER_FROM_RESULT}]
+            reminder: ContentPart = {"type": "text", "text": ANSWER_FROM_RESULT}
+            result = [*result, reminder]
         messages.append({"role": "user", "content": result})
         reply = ask_model(messages, session_id, errors)
         if reply is None:
@@ -1840,7 +1990,7 @@ def main() -> None:
     init_input_history()
     # Initialize conversation with system prompt and at least one dummy message
     # to ensure context is available on first user input
-    messages: list[dict[str, Any]] = [
+    messages: list[Message] = [
         {"role": "system", "content": system_prompt()},
     ]
     print(f"AI agent — using model: {MODEL}")
@@ -1946,14 +2096,14 @@ class Conversation:
 
     def __init__(self) -> None:
         self.session_id: str = uuid.uuid4().hex
-        self.messages: list[dict[str, Any]] = [
+        self.messages: list[Message] = [
             {"role": "system", "content": system_prompt()}
         ]
         # Held for a whole turn, so two requests of one session never run
         # against the same history at once.
-        self.lock = threading.Lock()
+        self.lock: threading.Lock = threading.Lock()
 
-    def ask(self, content: Any) -> tuple[str | None, str | None]:
+    def ask(self, content: Content) -> tuple[str | None, str | None]:
         """Answer one prompt with this conversation's history.
 
         Args:
@@ -2019,7 +2169,7 @@ def drop_oldest_conversation() -> bool:
     """
     for session_id, old in list(CONVERSATIONS.items()):
         if old.lock.acquire(blocking=False):
-            CONVERSATIONS.pop(session_id, None)
+            _ = CONVERSATIONS.pop(session_id, None)
             old.lock.release()
             return True
     return False
@@ -2027,7 +2177,7 @@ def drop_oldest_conversation() -> bool:
 
 def parse_request(
     body: bytes, media_type: str, session_header: str | None = None
-) -> tuple[Any, str | None, str | None]:
+) -> tuple[Content | None, str | None, str | None]:
     """Take the prompt and the session out of a request body.
 
     Args:
@@ -2045,22 +2195,23 @@ def parse_request(
     session = session_header
     if media_type == "application/json":
         try:
-            data = json.loads(body.decode("utf-8"))
+            decoded = cast(object, json.loads(body.decode("utf-8")))
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
             return None, None, f"invalid JSON body ({e})"
-        if not isinstance(data, dict):
+        if not isinstance(decoded, dict):
             return None, None, "the JSON body must be an object"
+        data = cast("dict[str, object]", decoded)
         if "session" in data:
             if not isinstance(data["session"], str):
                 return None, None, '"session" must be a string'
             session = data["session"]
         if isinstance(data.get("prompt"), str):
-            prompt: str = data["prompt"]
+            prompt = cast(str, data["prompt"])
             # The model is told which of the named files are binary, the same
             # way the CLI tells it, since their contents are not sent.
-            content: Any = prompt + binary_paths_note(prompt)
+            content: Content = prompt + binary_paths_note(prompt)
         elif isinstance(data.get("content"), list):
-            content = data["content"]
+            content = cast("Content", data["content"])
         else:
             return None, None, 'the body needs "prompt" (text) or "content" (parts)'
     else:
@@ -2133,6 +2284,9 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
         if error is not None:
             self._send_json(400, {"error": error})
             return
+        if content is None:  # only an invalid request gets here without content
+            self._send_json(400, {"error": "the prompt is empty"})
+            return
 
         conv = conversation(session_id)
         reply, error = conv.ask(content)
@@ -2187,7 +2341,7 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             return b"", f"a body of {length} bytes is too big", 413
         return self.rfile.read(length), None, 200
 
-    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+    def _send_json(self, status: int, payload: JsonObject) -> None:
         """Answer with a JSON body."""
         self._send(status, json.dumps(payload, ensure_ascii=False), "application/json")
 
@@ -2202,7 +2356,7 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", f"{media_type}; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        _ = self.wfile.write(body)
 
 
 def serve(host: str = SERVER_HOST, port: int = SERVER_PORT) -> None:
@@ -2246,17 +2400,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="agent.py",
         description="An AI agent in the terminal, or the same one over HTTP.",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--serve",
         action="store_true",
         help="answer prompts sent in HTTP requests instead of at the terminal",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--host",
         default=SERVER_HOST,
         help=f"address to listen on with --serve (default: {SERVER_HOST})",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--port",
         type=int,
         default=SERVER_PORT,
@@ -2267,7 +2421,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.serve:
-        serve(args.host, args.port)
+    serve_flag = cast(bool, args.serve)
+    host = cast(str, args.host)
+    port = cast(int, args.port)
+    if serve_flag:
+        serve(host, port)
     else:
         main()
